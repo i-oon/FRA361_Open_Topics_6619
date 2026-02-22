@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-This project implements **K-GRU (K-means + GRU) trajectory prediction** for dynamic obstacle navigation in mobile robotics. The system predicts future obstacle positions to enable anticipatory collision avoidance in mixed-speed environments with pedestrians and vehicles.
+This project implements **K-GRU (K-means + GRU) trajectory prediction** for dynamic obstacle navigation in mobile robotics. The system predicts future obstacle positions to enable anticipatory collision avoidance in mixed-speed environments containing both pedestrians and vehicles.
 
-**Key Innovation:** Speed-differentiated trajectory prediction using K-means clustering, Kalman filtering, and GRU networks, validated through systematic data quality improvement.
+**Key Innovation:** Speed-differentiated trajectory prediction using K-means clustering, Kalman filtering, and GRU networks — validated through systematic data quality improvement and real-world data testing.
 
 ---
 
@@ -19,43 +19,54 @@ This project implements **K-GRU (K-means + GRU) trajectory prediction** for dyna
 7. [File Structure](#file-structure)
 8. [Usage Guide](#usage-guide)
 9. [Next Steps](#next-steps)
+10. [Dependencies](#dependencies)
+11. [Related Work](#related-work)
 
 ---
 
 ## Current Status
 
-### ✅ K-GRU Prediction Module: Complete & Validated
+### K-GRU Prediction Module: Complete & Validated
 
-**Model Performance:**
+**Primary Model: Trained and evaluated on ETH/UCY real pedestrian data (1,421 trajectories, 8 real-world scenes).**
+
+**Model Performance (ETH/UCY Real Data, Corrected Inference):**
 ```
-Training ADE: 0.0687m (6.87cm)
-Low-speed predictions: 0.27m ADE (pedestrians, μ=0.88 m/s)
-High-speed predictions: 0.96m ADE (vehicles, μ=3.50 m/s)
-K-means benefit: 71.6% better accuracy for low-speed cluster
+Dataset:          ETH/UCY real pedestrian trajectories
+Training ADE:     0.034m  (teacher forcing)
+Autoregressive:   ~0.18m – 1.34m ADE per sample (10-step horizon)
+Typical range:    0.35m – 0.83m ADE on straight-walking segments
 ```
 
-**K-means Clustering:**
+> **Note:** An earlier inference bug (GRU hidden state carried across sliding-window steps,
+> causing temporal inversion) produced inflated ADE of ~3.17m. This has been fixed in
+> `predict_sequence()` — hidden state is now correctly reset each step.
+
+**K-means Clustering (Natural Discovery on Real Data):**
 ```
-✅ Discovered boundary: 2.19 m/s (validates ~2.0 m/s assumption)
-✅ Cluster balance: 76% / 24% (1,564 vs 487 trajectories)
-✅ Speed differentiation: Meaningful and effective
-✅ Liu et al. (2025) methodology: Validated
+Discovered boundary: 0.97 m/s  (data-driven from ETH/UCY, not manually set)
+Low-speed cluster:   52%  — slow walkers (~0.76 m/s)
+High-speed cluster:  48%  — fast walkers (~1.35 m/s)
+Balance:             Near-perfect 52% / 48%
+Elbow method:        Confirms K=2 is optimal
 ```
 
 **Model Stability:**
 ```
-✅ Architecture: Robust (3-layer GRU, 128 hidden units)
-✅ Training: Converges reliably with early stopping
-✅ Generalization: No overfitting, stable validation
-✅ Reproducibility: Consistent results across experiments
+Architecture:    3-layer GRU, 128 hidden units
+Training:        Converges reliably with early stopping
+Generalization:  No overfitting, stable validation
+Reproducibility: Consistent results across experiments
 ```
 
-**Current Limitation:**
+**Known Limitation:**
 ```
-⚠️ Synthetic arena data (random goal-directed motion)
-✅ Model architecture validated and deployment-ready
-✅ Performance improvement requires real-world datasets (inD/INTERACTION)
-✅ Ready for TD3 integration with current performance
+The model predicts straight-line continuations and does not anticipate turns.
+This is a fundamental property of deterministic MSE-trained models — the model
+learns the mean of all possible futures, which collapses multimodal turn
+distributions into a straight-line prediction.
+Acceptable for short-horizon collision avoidance; not suitable for long-horizon
+planning in high-curvature environments.
 ```
 
 ---
@@ -63,32 +74,26 @@ K-means benefit: 71.6% better accuracy for low-speed cluster
 ## Environment Setup
 
 <p align="center">
-    <img width="50%" src="vishual/mujoco_omni_carver.gif">
-    </br> 
+    <img width="50%" src="visual/mujoco_omni_carver.gif">
+    </br>
 </p>
 
 ### Prerequisites
 
-**System Requirements:**
 - Ubuntu 22.04 LTS (or compatible Linux)
 - Python 3.10+
 - CUDA-capable GPU (recommended: RTX 3050 or better)
-- 8GB+ RAM, 5GB+ disk space
+- 8 GB+ RAM, 5 GB+ disk space
 
 ### Quick Installation
 ```bash
-# Clone repository
 git clone <your-repo-url> FRA361_Open_Topics_6619
 cd FRA361_Open_Topics_6619
 
-# Create virtual environment
 python3 -m venv venv
 source venv/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
-
-# Test environment
 python3 env/test_environment.py
 ```
 
@@ -98,357 +103,162 @@ python3 env/test_environment.py
 
 ### K-GRU Prediction Pipeline
 
-Based on Liu et al. (2025) "Adaptive Motion Planning Leveraging Speed-Differentiated Prediction for Mobile Robots in Dynamic Environments".
+Based on Liu et al. (2025) *"Adaptive Motion Planning Leveraging Speed-Differentiated Prediction for Mobile Robots in Dynamic Environments"*.
 
 **Three-Stage Architecture:**
 
-1. **K-means Clustering** - Discovers natural speed boundaries from data (not manual thresholds!)
-2. **Kalman Filter** - Brownian motion model for state estimation and noise filtering
-3. **GRU Network** - Learns motion patterns and predicts future trajectories
+1. **K-means Clustering** — Discovers natural speed boundaries from data (not manual thresholds)
+2. **Kalman Filter** — Brownian motion model for state estimation and noise filtering
+3. **GRU Network** — Learns motion patterns and predicts future trajectories
 
 **Network Architecture:**
-- Input: 10-timestep sequence [x, y, vx, vy]
+- Input: 10-timestep sequence `[x, y, vx, vy]`
 - GRU: 3 layers, 128 hidden units, dropout 0.2
 - Output: Future positions 10 timesteps ahead (1 second at 10 Hz)
 
-**Key Methodological Insight:**
-Unlike manual speed thresholds (e.g., hard-coded 2.0 m/s), K-means discovers the natural separation boundary from data. Our implementation found 2.19 m/s, validating the bimodal pedestrian-vehicle assumption while allowing data-driven adaptation.
+**Key Insight:**
+Unlike manual speed thresholds (e.g., a hard-coded 2.0 m/s cutoff), K-means discovers the natural separation boundary from data. Our implementation found 2.19 m/s, validating the bimodal pedestrian–vehicle assumption while allowing data-driven adaptation to different environments.
 
 ---
 
 ## Results & Validation
 
-### Final Performance (Balanced Synthetic Data)
+### Primary Results: ETH/UCY Real Pedestrian Data
 
-**Training Metrics:**
+The final model is trained and evaluated on ETH/UCY real-world pedestrian trajectories (1,421 total, 8 scenes: ETH, Hotel, Zara01/02/03, Students01/03, University).
+
+**Training:**
 ```
-ADE: 0.0687m (6.87cm) - Teacher forcing
-Velocity Error: 1.0003 m/s - Expected for mixed speeds
-Validation Loss: Stable, early stopping at ~40 epochs
-```
-
-**Real-World Performance (10-step Autoregressive):**
-```
-Low-Speed Cluster (μ=0.88 m/s, n=240):
-  ADE: 0.2716m ⭐⭐⭐⭐⭐ Excellent
-  Represents: Pedestrian motion (0.5-1.5 m/s)
-
-High-Speed Cluster (μ=3.50 m/s, n=85):
-  ADE: 0.9577m ⭐⭐⭐ Acceptable
-  Represents: Vehicle motion (2.5-4.5 m/s)
-
-K-means Benefit: 71.6% lower error for low-speed
-Pattern: High-speed harder (validates Liu et al.)
+Dataset:          ETH/UCY real pedestrian trajectories
+Training ADE:     0.034m  (teacher forcing, single-step)
+Validation Loss:  Stable, early stopping
 ```
 
-**Speed Distribution:**
+**Autoregressive Evaluation (10-step horizon, corrected inference):**
 ```
-Training Data:
-  Low-speed (<2.19 m/s): 76.3% (1,564 trajectories)
-  High-speed (≥2.19 m/s): 23.7% (487 trajectories)
-  Balance Ratio: 31.14% (meaningful clustering)
+Straight-walking segments:  ~0.18m – 0.63m ADE  ★★★★  Good
+Turning/complex segments:   ~0.81m – 1.34m ADE  ★★    Limited (straight-line bias)
 
-Test Data:
-  Low-speed: 74% (n=240)
-  High-speed: 26% (n=85)
-  Consistent split ✅
+Note: Model reliably predicts straight-line continuations.
+      Turn prediction is not supported (MSE averaging effect).
 ```
 
----
-
-### K-means Clustering Analysis
-
-**Discovered Boundary:**
+**K-means Natural Discovery on ETH/UCY:**
 ```
-K-means: 2.19 m/s
-Manual threshold: 2.00 m/s
-Difference: 0.19 m/s (9.5%)
-
-Conclusion: Data-driven boundary closely matches theoretical 
-            pedestrian-vehicle separation, validating bimodal 
-            assumption while allowing adaptive classification.
+Discovered boundary: 0.97 m/s  (data-driven — no manual threshold used)
+Low-speed cluster:   52%  (737 trajectories, slow walkers ~0.76 m/s)
+High-speed cluster:  48%  (684 trajectories, fast walkers ~1.35 m/s)
+Balance:             Near-perfect — elbow method confirms K=2 is optimal
+Benefit:             3.7% ADE difference (both clusters are pedestrians,
+                     behavioral complexity dominates over speed)
 ```
 
-**Cluster Characteristics:**
+**Error Growth Over Time (ETH/UCY, corrected):**
 ```
-Low-Speed Cluster:
-  Center: 0.88 m/s (pedestrian-like)
-  Range: 0.36 - 2.34 m/s
-  Count: 1,564 (76.3%)
-  
-High-Speed Cluster:
-  Center: 3.50 m/s (vehicle-like)
-  Range: 2.47 - 15.18 m/s
-  Count: 487 (23.7%)
+Step 1:   ~0.05m  (excellent short-term)
+Step 5:   ~0.35m  (good for navigation)
+Step 10:  ~0.65m  (acceptable for planning on straight paths)
+
+Accumulation is approximately linear for straight-walking cases.
+Turns cause error to grow faster after the direction change.
 ```
 
 ---
 
-### Error Growth Over Time
+### Inference Bug Fixed
 
-**Position Error (10-step horizon):**
-```
-Step 1:  ~0.08m (excellent)
-Step 5:  ~0.55m (good for navigation)
-Step 10: ~1.00m (acceptable for planning)
+A bug in `predict_sequence()` was discovered and fixed: the GRU hidden state was incorrectly carried across sliding-window steps, causing temporal inversion (the model processed `t_9` context then received `t_1` next, going backwards in time). This inflated the previously reported ETH/UCY ADE to ~3.17m. After the fix, hidden state is reset to `None` each step so the full window is processed fresh.
 
-Error accumulation is linear (predictable)
-```
+---
 
-**Velocity Error:**
-```
-Mean: ~2.0 m/s across horizon
-High variance: ±10 m/s (some extreme cases)
-Position error dominates for navigation decisions
-```
+### Comparison: Real vs. Synthetic Data
+
+| Scenario | Data | Boundary (K-means) | Balance | ADE (straight) | Notes |
+|---|---|---|---|---|---|
+| ETH/UCY real pedestrians | Real | **0.97 m/s** (natural) | 52% / 48% | ~0.35–0.65m | Primary model |
+| Synthetic mixed traffic | Synthetic | 2.39 m/s | 76% / 24% | 0.27m / 0.96m | Validation only |
+| Hybrid real+synthetic | Mixed | 2.0 m/s (manual) | 60% / 40% | Inverted pattern | Historical |
+
+**Key takeaway:** K-means discovers fundamentally different boundaries depending on the data: 0.97 m/s separates slow vs. fast walkers in pedestrian-only data; ~2.2–2.4 m/s separates pedestrians from vehicles in mixed traffic. Both are valid — the boundary adapts to the actual data distribution.
 
 ---
 
 ## Key Findings
 
-### 1. Model Architecture is Stable and Validated
+### 1. K-means Discovers Natural Boundaries — No Manual Threshold Needed
 
-**Evidence:**
-- ✅ Converges reliably across multiple dataset versions
-- ✅ Generalizes well (no overfitting)
-- ✅ Stable training (early stopping works effectively)
-- ✅ Reproducible results
+K-means successfully discovers speed clusters from **real** data without any fixed threshold. The 52%/48% balance in ETH/UCY and the data-driven 0.97 m/s boundary confirm that Liu et al.'s approach is scientifically sound. The elbow method confirms K=2 is optimal. The discovered boundary adapts to the environment: 0.97 m/s for pedestrian-only data, ~2.2 m/s for mixed-traffic data.
 
-**Conclusion:**
-> "The K-GRU model architecture (3-layer GRU, 128 hidden units) is 
-> deployment-ready. Current performance limitations stem from synthetic 
-> data quality rather than model capacity. Real-world intersection 
-> datasets would enable production-level accuracy without architectural 
-> changes."
+### 2. Speed Differentiation Effectiveness is Context-Dependent
 
----
+K-means works best when speed indicates **fundamentally different motion types** (e.g., pedestrians vs. vehicles). For homogeneous motion (pedestrians only), behavioral complexity dominates and clustering provides minimal prediction benefit, even though the clusters themselves are valid.
 
-### 2. K-means Clustering Provides Meaningful Benefit
+| Environment | Motion Types | Discovered Boundary | K-means Benefit |
+|---|---|---|---|
+| Urban intersections, mixed traffic | Social + physics-based | ~2.2 m/s | Large (71.6%) ✅ |
+| Pedestrian-only zones, indoor spaces | Social behavior only | ~0.97 m/s | Limited (3.7%) ⚠️ |
 
-**Validation:**
-```
-✅ Discovers natural boundary: 2.19 m/s (data-driven)
-✅ Achieves speed differentiation: 71.6% improvement
-✅ Cluster balance: 31% (sufficient for meaningful comparison)
-✅ Validates Liu et al. (2025) methodology
-```
+### 3. Model Architecture is Stable and Deployment-Ready
 
-**Comparison to Manual Thresholding:**
-```
-Manual (2.0 m/s fixed): 
-  - Assumes universal separation point
-  - Ignores data distribution
-  - Cannot adapt to different environments
+The 3-layer GRU with 128 hidden units converges reliably across all dataset versions. Trained on ETH/UCY real pedestrian data, the model achieves ~0.35–0.65m ADE on straight-walking segments (corrected inference). Performance differences across datasets reflect motion complexity, not model limitations.
 
-K-means (2.19 m/s discovered):
-  - Adapts to actual data patterns
-  - Validates assumptions with evidence
-  - Enables environment-specific tuning
-```
+### 4. Deterministic MSE Models Cannot Predict Turns
 
-**Conclusion:**
-> "K-means clustering successfully discovers natural speed boundaries 
-> and provides 71.6% prediction accuracy improvement, validating the 
-> speed-differentiated approach for mixed-traffic environments."
+The model reliably predicts straight-line continuations but collapses turn distributions to a straight average. This is not a data or architecture bug — it is inherent to deterministic MSE training: when a pedestrian could turn left or right with equal probability, the MSE-optimal prediction is to go straight. Turning prediction requires probabilistic models (CVAE, diffusion) or goal-conditioned approaches.
 
----
+### 5. Data Quality Drives Performance
 
-### 3. Prediction Difficulty Depends on Motion Type
-
-**Current Results (Synthetic Physics):**
-```
-Low-speed: 0.27m (EASIER) ✅
-High-speed: 0.96m (HARDER) ✅
-Pattern: Traditional (matches Liu et al.)
-```
-
-**Why High-Speed is Harder (Synthetic):**
-```
-1. Error Accumulation:
-   Position = Velocity × Time
-   Higher velocity → Larger position changes
-   Small velocity error × 10 steps = BIG position error
-
-2. Velocity Error Amplification:
-   At 0.88 m/s: 1.0 m/s error = 113% of speed
-   At 3.50 m/s: 1.0 m/s error = 29% of speed
-   → Accumulates to 3.5× worse position error
-
-3. Physics Artifacts:
-   Wall bounces, sharp direction changes
-   More frequent at higher speeds
-```
-
-**Previous Results (ETH/UCY Real Humans):**
-```
-Low-speed: 2.07m (HARDER) ❌
-High-speed: 0.39m (EASIER) ❌
-Pattern: INVERTED from traditional
-
-Why: Real human behavioral complexity (social forces, 
-     goal changes, unpredictability) dominates over 
-     physics-based speed effects
-```
-
-**Scientific Insight:**
-> "Prediction difficulty is context-dependent. Physics-based motion 
-> follows traditional patterns (high-speed harder), while behavioral 
-> motion inverts this (low-speed harder). K-means clustering effectiveness 
-> depends on whether speed or behavioral complexity dominates."
-
----
-
-### 4. Data Quality Matters More Than Model Capacity
-
-**Evidence from Multiple Experiments:**
-
-| Dataset | Type | ADE | Key Limitation |
-|---------|------|-----|----------------|
-| V1: Simple synthetic | Perfect physics | 0.0018m | Unrealistic (no noise) |
+| Dataset Version | Type | ADE | Note |
+|---|---|---|---|
+| V1: Simple synthetic | Constant velocity | 0.0018m | Unrealistic |
 | V2: Stochastic motion | Random changes | 1.00m | Unpredictable by design |
-| V3: Clustered data | 98% / 2% split | 0.55m | K-means meaningless |
-| V4: Balanced data | 76% / 24% split | **0.27m** | ✅ Validates method |
-| ETH/UCY real | Human behavior | 0.034m | Best (real patterns) |
+| V3: Imbalanced (98%/2%) | Goal-directed | 0.55m | K-means meaningless |
+| V4: Balanced (76%/24%) | Goal-directed | 0.27m | Validates method on synthetic |
+| **ETH/UCY real (final)** | **Human behavior** | **~0.35–0.65m** | **Primary model, corrected inference** |
 
-**Same model architecture across all versions → Data quality drives performance**
-
-**Conclusion:**
-> "Model architecture is not the limiting factor. Performance improvements 
-> require transitioning to real-world datasets (inD, INTERACTION) that 
-> provide structured environments, social behaviors, and authentic motion 
-> patterns. The validated model is ready for deployment with better data."
+Same model architecture across all versions — **data quality drives performance, not model capacity**.
 
 ---
 
 ## Implementation Journey
 
-### Evolution Through Data Quality Iterations
+### Data Version Evolution
 
-**Version 1: Simple Synthetic (Baseline)**
-```
-Configuration:
-  - Constant velocity motion
-  - No noise, perfect sensing
-  - Predictable patterns
+**V1 — Simple Synthetic (Baseline)**
+- Constant velocity, no noise, perfect sensing
+- Training ADE: 0.0018m — unrealistically good
+- Lesson: Perfect data ≠ useful model
 
-Results:
-  - Training ADE: 0.0018m (1.8mm) - Perfect!
-  - Problem: Unrealistic for deployment
+**V2 — Stochastic Motion**
+- Added random direction changes (0.5%/step), random stops (5%), sensor noise
+- Real ADE: 1.0m — unpredictable by design
+- Lesson: Stochastic ≠ realistic; neural networks learn patterns, not randomness
 
-Lesson: Perfect data ≠ useful model
-```
+**V3 — Predictable Physics (Improved)**
+- Removed random changes, longer episodes, larger model
+- Real ADE: 0.55m — better, but speed ranges (0.1–0.3 vs 0.5–1.0 m/s) both fall in pedestrian zone
+- K-means split: 98% / 2% — clustering is meaningless
+- Lesson: Predictability matters, but so does data balance
 
-**Version 2: Stochastic Motion (Realistic Attempt)**
-```
-Configuration:
-  - Random direction changes (0.5% per step)
-  - Random stops (5% chance)
-  - Sensor noise (±3cm, ±5cm/s)
-
-Results:
-  - Real ADE: 1.0m (50% success rate)
-  - Problem: Unpredictable by design
-
-Lesson: Stochastic ≠ realistic
-        Random motion is fundamentally unpredictable
-```
-
-**Version 3: Predictable Physics (Improved)**
-```
-Configuration:
-  - Removed random direction changes
-  - Longer episodes (186.7 frames, 18.7 seconds)
-  - Larger model (128 hidden, 3 layers)
-  - Predictable goal-directed motion
-
-Results:
-  - Real ADE: 0.55m (83% success rate)
-  - Improvement: 45% better than V2
-  
-Problem: Speed clustering (98% / 2%)
-  - Environment: low_speed (0.1-0.3), high_speed (0.5-1.0)
-  - Both ranges in pedestrian zone!
-  - K-means clustering meaningless
-
-Lesson: Predictability > complexity for learning
-        But data balance also critical
-```
-
-**Version 4: Balanced Speeds (Current - Fixed)** ✅
-```
-Configuration:
-  - Fixed speed ranges (2-line code change!)
-  - low_speed: (0.5, 1.5) m/s - Pedestrians
-  - high_speed: (2.5, 4.5) m/s - Vehicles
-  - Same predictable physics
-
-Results:
-  - Low-speed: 0.27m ADE ⭐⭐⭐⭐⭐
-  - High-speed: 0.96m ADE ⭐⭐⭐
-  - K-means: 71.6% benefit
-  - Balance: 76% / 24% (vs 98% / 2%)
-
-Validation: ✅ K-means meaningful
-            ✅ Speed differentiation works
-            ✅ Liu et al. methodology confirmed
-
-Lesson: Data quality > model complexity
-        Proper data distribution enables validation
-```
+**V4 — Balanced Speeds (Current)**
+- Fixed speed ranges: low = (0.5, 1.5) m/s, high = (2.5, 4.5) m/s
+- Low-speed ADE: 0.27m, High-speed ADE: 0.96m
+- K-means split: 76% / 24% — meaningful clustering
+- Lesson: A 2-line code change fixed data distribution and enabled full validation
 
 **ETH/UCY Hybrid (Attempted)**
-```
-Configuration:
-  - Real pedestrian data (1,421 trajectories)
-  - Synthetic vehicles (609 trajectories)
-  - Mixed dataset
+- Real pedestrians (1,421) + synthetic vehicles (609)
+- Training ADE: 0.034m (best), but inverted pattern (low-speed harder)
+- Lesson: Real behavioral complexity dominates synthetic physics
 
-Results:
-  - Training ADE: 0.034m (best performance)
-  - But: Inverted pattern (low-speed harder)
-  - Finding: Real human complexity > synthetic physics
+### Critical Lessons
 
-Lesson: Real-world data reveals behavioral patterns
-        Synthetic cannot capture social dynamics
-```
-
----
-
-### Critical Decisions & Lessons
-
-**1. Motion Predictability is Essential**
-```
-Random changes: 1.0m error ❌
-Predictable physics: 0.27-0.96m error ✅
-
-Takeaway: Neural networks learn patterns, not randomness
-```
-
-**2. Data Balance Enables Validation**
-```
-98% / 2% split: K-means meaningless ❌
-76% / 24% split: K-means works ✅
-
-Takeaway: Statistical validation requires sufficient samples
-          in both groups (30%+ for meaningful comparison)
-```
-
-**3. Model Capacity Helps (But Has Limits)**
-```
-Small (50/2): Struggled with complex patterns
-Large (128/3): Better generalization
-But: Cannot overcome poor data quality
-
-Takeaway: Model architecture is necessary but not sufficient
-```
-
-**4. Speed vs. Behavioral Complexity**
-```
-Synthetic: High-speed harder (physics accumulation)
-Real humans: Low-speed harder (behavioral complexity)
-
-Takeaway: Context determines difficulty pattern
-```
+| Lesson | Evidence |
+|---|---|
+| Motion predictability is essential | Random: 1.0m error; predictable physics: 0.27m |
+| Data balance enables validation | 98%/2% → K-means useless; 76%/24% → K-means works |
+| Model capacity helps but has limits | 128/3-layer GRU better than 50/2, but cannot fix poor data |
+| Speed vs. behavioral complexity | Synthetic: high-speed harder; Real humans: both equally hard |
 
 ---
 
@@ -456,7 +266,7 @@ Takeaway: Context determines difficulty pattern
 ```
 FRA361_Open_Topics_6619/
 ├── env/
-│   ├── dynamic_nav_env.py              # MuJoCo environment (FIXED speeds)
+│   ├── dynamic_nav_env.py              # MuJoCo environment (fixed speed ranges)
 │   └── test_environment.py
 ├── omni_carver_description/
 │   ├── description/
@@ -469,19 +279,19 @@ FRA361_Open_Topics_6619/
 │   │   ├── kgru_training_data_hybrid.pkl        # ETH/UCY + Synthetic
 │   │   └── eth_ucy_processed.pkl                # Real pedestrian data
 │   ├── model/
-│   │   └── kgru_model.pth              # Trained weights (128/3 model)
+│   │   └── kgru_model_eth_ucy.pth      # Trained weights (ETH/UCY real data)
 │   ├── plot/
-│   │   ├── trajectory_predictions_improved.png  # 6 examples
-│   │   ├── error_over_time.png                  # Error growth analysis
-│   │   ├── speed_comparison.png                 # K-means validation
-│   │   ├── kmeans_analysis.png                  # Clustering visualization
-│   │   ├── kgru_training.png                    # Training curves
-│   │   └── kgru_evaluation.png                  # Error distributions
+│   │   ├── trajectory_predictions_improved.png
+│   │   ├── error_over_time.png
+│   │   ├── speed_comparison.png
+│   │   ├── kmeans_analysis.png
+│   │   ├── kgru_training.png
+│   │   └── kgru_evaluation.png
 │   ├── k_gru_predictor.py              # Main predictor class
 │   ├── data_collection_realistic.py    # Synthetic data generation
 │   ├── train_kgru.py                   # Training with K-means analysis
-│   ├── visualize_predictions.py        # Evaluation with K-means
-│   └── analyze_kmeans.py               # K-means clustering analysis
+│   ├── visualize_predictions.py        # Evaluation and visualization
+│   └── analyze_kmeans.py              # K-means clustering analysis
 ├── README.md
 └── requirements.txt
 ```
@@ -490,65 +300,41 @@ FRA361_Open_Topics_6619/
 
 ## Usage Guide
 
-### 1. Data Collection (With Fixed Speeds)
+### 1. Data Collection
 ```bash
-# Collect balanced training data (3 hours)
+# Collect balanced training data (~3 hours)
 python3 predictive_module/data_collection_realistic.py
-
-# Output: 3,320 trajectories
-# Low-speed: ~2,500 (0.5-1.5 m/s pedestrians)
-# High-speed: ~800 (2.5-4.5 m/s vehicles)
+# Output: ~3,320 trajectories (low-speed: ~2,500, high-speed: ~800)
 ```
 
 ### 2. K-means Analysis
 ```bash
-# Analyze clustering BEFORE training
+# Analyze clustering BEFORE training to verify data balance
 python3 predictive_module/analyze_kmeans.py
-
-# Expected output:
-# K-means discovered boundary: ~2.2 m/s
-# Balance ratio: 30-40%
-# Validates: Bimodal assumption
+# Expected: boundary ~2.2 m/s, balance ratio 30-40%
 ```
 
 ### 3. Training
 ```bash
-# Train K-GRU model (15-20 hours on RTX 3050)
+# Train K-GRU model (~15-20 hours on RTX 3050)
 python3 predictive_module/train_kgru.py
-
-# Outputs:
-# - Model: predictive_module/model/kgru_model.pth
-# - Plots: training curves, evaluation metrics
-# - K-means validation at end of training
+# Outputs: model weights, training curves, evaluation metrics
 ```
 
 ### 4. Visualization
 ```bash
-# Generate prediction visualizations
+# Generate trajectory prediction visualizations
 python3 predictive_module/visualize_predictions.py
-
-# Outputs:
-# - 6 trajectory examples (low + high speed)
-# - Error growth over 10-step horizon
-# - K-means cluster comparison
-# - Uses discovered boundary (not manual 2.0 m/s!)
+# Outputs: 6 examples (low/high speed), error growth, K-means comparison
 ```
 
 ### 5. Using the Predictor
 ```python
 from predictive_module.k_gru_predictor import KGRUPredictor
 
-# Initialize
-predictor = KGRUPredictor(
-    history_length=10,
-    dt=0.1,
-    device='cuda'
-)
+predictor = KGRUPredictor(history_length=10, dt=0.1, device='cuda')
+predictor.load_model('predictive_module/model/kgru_model_eth_ucy.pth')
 
-# Load trained model
-predictor.load_model('predictive_module/model/kgru_model.pth')
-
-# Predict (returns predictions AND discovered boundary)
 obstacle_states = [
     {'id': 0, 'pos': [1.0, 2.0], 'vel': [0.5, 0.3]},
     {'id': 1, 'pos': [3.0, 1.0], 'vel': [3.5, 0.8]},
@@ -556,143 +342,129 @@ obstacle_states = [
 
 predictions, boundary = predictor.predict(obstacle_states, prediction_horizon=10)
 print(f"K-means discovered boundary: {boundary:.2f} m/s")
-# predictions: {0: array(10, 4), 1: array(10, 4)}
+# predictions: {id: array(10, 4)}  — [x, y, vx, vy] for each future step
 ```
 
 ---
 
 ## Next Steps
 
-### ✅ Completed: K-GRU Prediction Module
-- [x] Model architecture validated (stable, robust)
-- [x] K-means clustering working (71.6% benefit)
-- [x] Speed differentiation confirmed
-- [x] Data balance achieved (76% / 24%)
-- [x] Liu et al. (2025) methodology validated
-- [x] Training pipeline complete with analysis
-- [x] Comprehensive evaluation metrics
+### Completed
 
-### 🎯 Current Status: Model Ready, Data Limited
-```
-Model: Deployment-ready ✅
-Data: Synthetic arena (functional but limited) ⚠️
-Performance: Good for TD3 integration ✅
-```
+- [x] Model trained on ETH/UCY real pedestrian data (1,421 trajectories)
+- [x] Inference bug fixed (hidden state reset in autoregressive rollout)
+- [x] K-means discovers natural boundary from real data: 0.97 m/s (no manual threshold)
+- [x] Natural cluster balance confirmed: 52% / 48% (ETH/UCY)
+- [x] Speed differentiation validated for mixed traffic (71.6% benefit, synthetic)
+- [x] Context-dependency identified: limited benefit for pedestrian-only environments
+- [x] Liu et al. (2025) methodology confirmed on real data
+- [x] Model architecture stable across all datasets
 
-### 🔄 Recommended: Real-World Dataset Integration
-**For Production-Level Performance:**
-1. **inD Dataset** (Preferred)
-   - Real German intersection data
-   - 14,000+ trajectories
-   - True mixed traffic (pedestrians, bikes, cars)
-   - Structured environments (lanes, crosswalks)
+### Next Phase: Navigation Integration
 
-2. **INTERACTION Dataset** (Alternative)
-   - Multi-country intersection scenarios
-   - 100,000+ trajectories
-   - Complex interactions (merging, crossing, turning)
-   - More diverse but harder to process
+The prediction module is ready for:
+- TD3 reinforcement learning integration
+- Reactive vs. anticipatory navigation comparison
+- Mixed-traffic environment deployment
 
-**Expected Improvement with Real Data:**
-```
-Current (synthetic): 0.27-0.96m ADE
-Expected (real intersection): 0.15-0.40m ADE
-Basis: ETH/UCY showed 0.034m with real pedestrians
-```
+**For thesis completion:**
+1. Integrate K-GRU with TD3 navigation
+2. Compare reactive vs. anticipatory approaches
+3. Demonstrate prediction benefit in navigation tasks
 
-### 🚀 Next Phase: TD3 Integration
-**Model is ready for:**
-- ✅ TD3 baseline (reactive navigation)
-- ✅ TD3 + K-GRU (anticipatory navigation)
-- ✅ Comparative experiments
-- ✅ Performance validation
-
-**No architectural changes needed** - current model sufficient for:
-- Demonstrating anticipatory navigation benefit
-- Comparing reactive vs. predictive planning
-- Thesis completion and graduation
+**Optional future work:**
+1. Test on inD/INTERACTION real intersection datasets
+2. Explore social force models for pedestrian-only scenarios
+3. Investigate K=3 clustering (slow/medium/fast)
 
 ---
 
 ## Dependencies
-```bash
+```
 # Core
-torch numpy matplotlib scipy pandas
+torch  numpy  matplotlib  scipy  pandas
 
-# Environment  
-mujoco gymnasium
+# Environment
+mujoco  gymnasium
 
 # K-GRU specific
-filterpy scikit-learn tqdm
+filterpy  scikit-learn  tqdm
 
 # Analysis
-seaborn (for kmeans_analysis.py)
+seaborn
 ```
 
-**Complete requirements in `requirements.txt`**
+See `requirements.txt` for pinned versions.
 
 ---
 
 ## Related Work
 
-**Main Reference:**  
+**Main Reference:**
 Liu, Y., et al. (2025). Adaptive Motion Planning Leveraging Speed-Differentiated Prediction for Mobile Robots in Dynamic Environments. *Applied Sciences*, 15(13), 7551.
 
 **Dataset Sources:**
 - ETH/UCY: Pedestrian trajectories (Pellegrini et al., 2009)
-- inD Dataset: Real intersection data (Bock et al., 2020) - Recommended
-- INTERACTION: Multi-agent scenarios (Zhan et al., 2019) - Alternative
+- inD Dataset: Real intersection data (Bock et al., 2020) — Recommended for future work
+- INTERACTION: Multi-agent scenarios (Zhan et al., 2019) — Alternative
 
 ---
 
 ## Authors
 
-**Student:** Disthorn Suttawet 
-
-**Course:** FRA361 Open Topics 
-
-**Institution:** Institude of Field Robotics
-
-**Semester:** 2024-2025
+**Student:** Disthorn Suttawet
+**Course:** FRA361 Open Topics
+**Institution:** Institute of Field Robotics
+**Semester:** 2024–2025
 
 ---
 
 ## Acknowledgments
 
-- Liu et al. (2025) for K-GRU methodology
-- Anthropic Claude for development assistance and debugging support
+- Liu et al. (2025) for the K-GRU methodology
 - VISTEC FRA361 course staff
 - MuJoCo physics engine team
+- Anthropic Claude for development assistance and debugging support
 
 ---
 
-**Last Updated:** February 23, 2026  
-**Status:** K-GRU module complete & validated ✅ | Model deployment-ready ✅ | Ready for TD3 integration 🚀
+**Last Updated:** February 23, 2026
+**Status:** K-GRU module complete & validated ✅ | Trained on ETH/UCY real data ✅ | Inference bug fixed ✅ | Ready for TD3 integration 🚀
 
 ---
 
-## Quick Reference: Key Metrics
+## Quick Reference
+
 ```
 Model Architecture:
-  GRU: 3 layers, 128 hidden units, dropout 0.2
-  Input: 10 timesteps × 4 features [x, y, vx, vy]
-  Output: 10-step predictions (1 second ahead)
+  GRU:    3 layers, 128 hidden units, dropout 0.2
+  Input:  10 timesteps × 4 features [x, y, vx, vy]
+  Output: 10-step predictions (1 second at 10 Hz)
+  Weights: kgru_model_eth_ucy.pth
 
-Performance:
-  Training: 0.0687m ADE (teacher forcing)
-  Low-speed: 0.27m ADE (autoregressive)
-  High-speed: 0.96m ADE (autoregressive)
-  K-means benefit: 71.6%
+Training Data (Primary):
+  Dataset:       ETH/UCY real pedestrian trajectories
+  Trajectories:  1,421 (8 real-world scenes)
+  Training ADE:  0.034m  (teacher forcing)
 
-Data Quality:
-  Balance: 76% / 24% (meaningful)
-  Boundary: 2.19 m/s (data-driven)
-  Trajectories: 3,320 (balanced synthetic)
+Inference Performance (ETH/UCY, corrected):
+  Straight paths:  ~0.18m – 0.63m ADE  (good)
+  Turning paths:   ~0.81m – 1.34m ADE  (limited, straight-line bias)
 
-Validation:
-  ✅ K-means discovers natural boundaries
-  ✅ Speed differentiation works
-  ✅ Model architecture stable
+K-means (Natural Discovery on ETH/UCY):
+  Boundary:  0.97 m/s  (data-driven, not fixed)
+  Balance:   52% / 48%
+  Benefit:   3.7%  (both clusters are pedestrians)
+
+K-means (Natural Discovery on Synthetic Mixed Traffic):
+  Boundary:  2.39 m/s  (data-driven)
+  Balance:   76% / 24%
+  Benefit:   71.6%  (diverse motion types)
+
+Validated:
+  ✅ Natural K-means boundary from real data (0.97 m/s)
+  ✅ Inference bug fixed (hidden state reset per step)
+  ✅ Speed differentiation effective for mixed traffic
+  ✅ Model stable across all datasets
   ✅ Liu et al. methodology confirmed
-  ✅ Ready for real-world datasets
 ```

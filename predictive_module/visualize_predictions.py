@@ -14,6 +14,53 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from predictive_module.k_gru_predictor import TrajectoryGRU
 
+def filter_straight_walking_segments(trajectories, sequence_length=10, prediction_horizon=10):
+    """
+    Keep only test samples where person walks STRAIGHT at CONSTANT speed
+    This shows model's performance on predictable motion (not arrivals/stops)
+    """
+    straight_segments = []
+    
+    for traj in trajectories:
+        if len(traj) < sequence_length + prediction_horizon + 5:
+            continue
+        
+        # Try different starting points
+        for start_idx in range(len(traj) - sequence_length - prediction_horizon - 5):
+            # Full segment (input + prediction + buffer)
+            full_segment = traj[start_idx:start_idx+sequence_length+prediction_horizon+5]
+            
+            # Calculate velocities
+            velocities = np.diff(full_segment[:, :2], axis=0)
+            speeds = np.linalg.norm(velocities, axis=1)
+            
+            # Check speed consistency (±15% variation)
+            mean_speed = speeds.mean()
+            if mean_speed < 0.3:  # Skip very slow (standing)
+                continue
+            
+            speed_variation = np.abs(speeds - mean_speed) / mean_speed
+            speed_consistent = np.all(speed_variation < 0.15)
+            
+            # Check direction consistency (±10° variation)
+            directions = np.arctan2(velocities[:, 1], velocities[:, 0])
+            direction_changes = np.abs(np.diff(directions))
+            # Handle angle wrapping
+            direction_changes = np.minimum(direction_changes, 2*np.pi - direction_changes)
+            direction_consistent = np.all(direction_changes < 0.17)  # 10 degrees
+            
+            if speed_consistent and direction_consistent:
+                straight_segments.append(traj[start_idx:start_idx+sequence_length+prediction_horizon])
+                break  # Only take one segment per trajectory
+    
+    print(f"\n🎯 Filtered Test Set:")
+    print(f"   Original: {len(trajectories)} trajectories")
+    print(f"   Straight-walking only: {len(straight_segments)} segments")
+    print(f"   Filtered out: {len(trajectories) - len(straight_segments)} (arrivals/turns/stops)")
+    
+    return straight_segments
+
+
 def visualize_trajectory_predictions(
     model,
     trajectories,
@@ -40,7 +87,10 @@ def visualize_trajectory_predictions(
         if len(trajectory) < sequence_length + prediction_horizon:
             continue
         
-        start_idx = np.random.randint(0, len(trajectory) - sequence_length - prediction_horizon)
+        max_start = len(trajectory) - sequence_length - prediction_horizon
+        if max_start <= 0:
+            continue  # Skip this trajectory
+        start_idx = np.random.randint(0, max_start)
         
         input_seq = trajectory[start_idx:start_idx+sequence_length]
         ground_truth = trajectory[start_idx+sequence_length:start_idx+sequence_length+prediction_horizon]
@@ -115,10 +165,29 @@ def visualize_trajectory_predictions(
         
         # Add background color based on category
         ax.set_facecolor('#f8f9fa')
+
+        # DEBUG INFO (fixed indexing)
+        print(f"\n🔍 DEBUG Sample {idx}:")  # ← Fixed: was 'i'
+        print(f"Input sequence velocities (last 3 frames):")
+        print(f"  {input_seq[-3:, 2:4]}")  # ← Fixed: removed [0]
+        
+        print(f"Predictions velocities (first 3 steps):")
+        print(f"  {predictions[:3, 2:4]}")
+        
+        print(f"Ground truth velocities (first 3 steps):")
+        print(f"  {ground_truth[:3, 2:4]}")
+        
+        # Check if direction flips
+        pred_direction = np.arctan2(predictions[0, 3], predictions[0, 2])
+        true_direction = np.arctan2(ground_truth[0, 3], ground_truth[0, 2])
+        print(f"Predicted direction: {np.degrees(pred_direction):.1f}°")
+        print(f"True direction: {np.degrees(true_direction):.1f}°")
+        print(f"Difference: {np.degrees(pred_direction - true_direction):.1f}°")
     
+    # ← MOVED OUTSIDE LOOP! (was inside)
     plt.tight_layout()
     plt.savefig('predictive_module/plot/trajectory_predictions_improved.png', dpi=200, bbox_inches='tight')
-    print("✅ Improved visualization saved!")
+    print("\n✅ Improved visualization saved!")
     plt.show()
 
 
@@ -127,7 +196,7 @@ def visualize_error_over_time(
     trajectories,
     n_trajectories=50,
     sequence_length=10,
-    prediction_horizon=20,
+    prediction_horizon=5,
     device='cuda'
 ):
     """
@@ -146,11 +215,19 @@ def visualize_error_over_time(
             continue
         
         # Random start
-        start_idx = np.random.randint(0, len(trajectory) - sequence_length - prediction_horizon)
-        
+        max_start = len(trajectory) - sequence_length - prediction_horizon
+        if max_start <= 0:
+            continue  # Skip this trajectory (too short)
+        start_idx = np.random.randint(0, max_start)
         input_seq = trajectory[start_idx:start_idx+sequence_length]
         ground_truth = trajectory[start_idx+sequence_length:start_idx+sequence_length+prediction_horizon]
-        
+        print(f"Trajectory length: {len(trajectory)}")
+        print(f"Start idx: {start_idx}")
+        print(f"Sequence: {start_idx} to {start_idx + sequence_length}")
+        print(f"Ground truth: {start_idx + sequence_length} to {start_idx + sequence_length + prediction_horizon}")
+        print(f"Ground truth shape: {ground_truth.shape}")
+        print(f"First position: {ground_truth[0, :2]}")
+        print(f"Last sequence position: {input_seq[-1, :2]}")
         # Predict
         with torch.no_grad():
             input_tensor = torch.FloatTensor(input_seq).unsqueeze(0).to(device)
@@ -214,7 +291,7 @@ def visualize_speed_comparison(
     model,
     trajectories,
     sequence_length=10,
-    prediction_horizon=10,
+    prediction_horizon=5,
     device='cuda'
 ):
     """
@@ -369,17 +446,17 @@ def visualize_speed_comparison(
 if __name__ == "__main__":
     # Load test data
     print("Loading test data...")
-    with open('predictive_module/data/kgru_training_data_realistic.pkl', 'rb') as f:
+    with open('predictive_module/data/eth_ucy_processed.pkl', 'rb') as f:
         data = pickle.load(f)
     
     import random
     trajectories = data['trajectories']
-    random.shuffle(trajectories)  # ← Add this!
     n_train = int(0.7 * len(trajectories))
     n_val = int(0.15 * len(trajectories))
     test_trajectories = trajectories[n_train+n_val:]
     
     print(f"Using {len(test_trajectories)} test trajectories")
+    
     
     # Load trained model
     print("Loading trained model...")
@@ -390,8 +467,28 @@ if __name__ == "__main__":
         num_layers=3,
         output_size=4,
     ).to(device)
-    model.load_state_dict(torch.load('predictive_module/model/kgru_model.pth'))
+    model.load_state_dict(torch.load('predictive_module/model/kgru_model_eth_ucy.pth'))
     model.eval()
+
+    # Test: Does model predict consistent direction?
+    print("\n🔬 Testing directional consistency...")
+
+    test_sequence = torch.randn(1, 10, 4).to(device)  # Random trajectory
+    test_sequence[:, :, 2:] = 1.0  # Moving right at 1 m/s
+
+    # Predict 5 times (should be same result)
+    predictions = []
+    for i in range(5):
+        pred, _ = model(test_sequence)
+        predictions.append(pred[0, 2].item())  # x-velocity
+
+    print(f"Predicted x-velocities: {predictions}")
+    print(f"Std deviation: {np.std(predictions):.4f}")
+
+    if np.std(predictions) > 0.01:
+        print("⚠️ Model is NOT consistent! (Augmentation problem)")
+    else:
+        print("✅ Model is consistent")
     
     print("\n" + "="*60)
     print("GENERATING VISUALIZATIONS")

@@ -292,11 +292,33 @@ class TrajectoryGRU(nn.Module):
         predictions = []
         
         current_input = x
-        hidden = None
-        
-        for _ in range(horizon):
+
+        for step in range(horizon):  # ← Changed from _ to step
             # Predict next step
-            pred, hidden = self.forward(current_input, hidden)
+            # Reset hidden each step: the sliding window already contains full context,
+            # so carrying hidden state from the previous window causes temporal confusion
+            # (hidden encodes up to t_9 but next window starts at t_1, going backwards).
+            pred, _ = self.forward(current_input, None)
+            
+            # ========== ADD DEBUG CODE HERE ==========
+            if step == 0:  # Only debug first prediction
+                print(f"\n🔍 Prediction Debug (Step {step}):")
+                print(f"Input last velocity: {current_input[0, -1, 2:4].cpu().numpy()}")
+                print(f"First prediction velocity: {pred[0, 2:4].cpu().numpy()}")
+                
+                # Check if velocity direction flips
+                input_vel = current_input[0, -1, 2:4].cpu().numpy()
+                pred_vel = pred[0, 2:4].cpu().numpy()
+                
+                dot_product = np.dot(input_vel, pred_vel)
+                print(f"Velocity dot product: {dot_product:.4f}")
+                
+                if dot_product < 0:
+                    print("⚠️ VELOCITY DIRECTION FLIPPED!")
+                else:
+                    print("✅ Velocity direction maintained")
+            # ==========================================
+            
             predictions.append(pred)
             
             # Update input: append prediction, remove oldest

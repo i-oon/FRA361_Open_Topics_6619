@@ -288,6 +288,7 @@ def evaluate_predictions(model, test_loader, device='cuda', save_plots=True):
     return ade, fde, vel_error
 
 
+
 def analyze_kmeans_clustering(train_trajectories):
     """
     Analyze K-means clustering on training data
@@ -370,7 +371,7 @@ def analyze_kmeans_clustering(train_trajectories):
 if __name__ == "__main__":
     # Load collected data
     print("Loading training data...")
-    with open('predictive_module/data/kgru_training_data_realistic.pkl', 'rb') as f:
+    with open('predictive_module/data/eth_ucy_processed.pkl', 'rb') as f:
         data = pickle.load(f)
     
     trajectories = data['trajectories']
@@ -387,7 +388,7 @@ if __name__ == "__main__":
     print(f"Split: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test")
     
     # Create datasets
-    train_dataset = TrajectoryDataset(train_data, sequence_length=10, augment=True)
+    train_dataset = TrajectoryDataset(train_data, sequence_length=10, augment=False)
     val_dataset = TrajectoryDataset(val_data, sequence_length=10, augment=False)
     test_dataset = TrajectoryDataset(test_data, sequence_length=10, augment=False)
     
@@ -423,11 +424,11 @@ if __name__ == "__main__":
         lr=0.001,
         device=device,
         patience=15,
-        save_path='predictive_module/model/kgru_model.pth'
+        save_path='predictive_module/model/kgru_model_eth_ucy.pth'
     )
     
     # Load best model for evaluation
-    model.load_state_dict(torch.load('predictive_module/model/kgru_model.pth'))
+    model.load_state_dict(torch.load('predictive_module/model/kgru_model_eth_ucy.pth'))
     
     # Evaluate on test set
     ade, fde, vel_error = evaluate_predictions(model, test_loader, device=device)
