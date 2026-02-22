@@ -291,7 +291,7 @@ def evaluate_predictions(model, test_loader, device='cuda', save_plots=True):
 if __name__ == "__main__":
     # Load collected data
     print("Loading training data...")
-    with open('predictive_module/data/kgru_training_data_realistic.pkl', 'rb') as f:
+    with open('predictive_module/data/kgru_training_data_hybrid.pkl', 'rb') as f:
         data = pickle.load(f)
     
     trajectories = data['trajectories']

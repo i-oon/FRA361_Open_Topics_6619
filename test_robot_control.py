@@ -9,7 +9,7 @@ print("Testing holonomic control...")
 print(f"Actuators: {model.nu}")
 
 with mujoco.viewer.launch_passive(model, data) as viewer:
-    for i in range(2000):
+    for i in range(20000):
         t = i * 0.002  # timestep
         
         # Test holonomic motion: circle + forward

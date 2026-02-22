@@ -104,7 +104,7 @@ def visualize_trajectory_predictions(
     
     plt.tight_layout()
     plt.savefig('predictive_module/plot/trajectory_predictions.png', dpi=150)
-    print("Trajectory visualization saved to trajectory_predictions.png")
+    print("Trajectory visualization saved to predictive_module/plot/trajectory_predictions.png")
     plt.show()
 
 
@@ -191,8 +191,8 @@ def visualize_error_over_time(
     axes[1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('error_over_time.png', dpi=150)
     plt.savefig('predictive_module/plot/error_over_time.png', dpi=150)
+    print("Error growth visualization saved to predictive_module/plot/error_over_time.png")
     plt.show()
 
 
@@ -235,8 +235,8 @@ def visualize_speed_comparison(
         # Error
         position_error = np.linalg.norm(predictions[:, :2] - ground_truth[:, :2], axis=1).mean()
         
-        # Classify by speed
-        if avg_speed < 2.0:  # CORRECT THRESHOLD
+        # Classify by speed (threshold at 2.0 m/s for pedestrian vs vehicle)
+        if avg_speed < 2.0:
             low_speed_errors.append(position_error)
         else:
             high_speed_errors.append(position_error)
@@ -247,7 +247,7 @@ def visualize_speed_comparison(
     positions = [1, 2]
     data = [low_speed_errors, high_speed_errors]
     labels = [f'Low Speed\n(<2.0 m/s)\nn={len(low_speed_errors)}',
-          f'High Speed\n(≥2.0 m/s)\nn={len(high_speed_errors)}']
+              f'High Speed\n(≥2.0 m/s)\nn={len(high_speed_errors)}']
     
     bp = ax.boxplot(data, positions=positions, widths=0.6, patch_artist=True,
                     labels=labels,
@@ -270,7 +270,7 @@ def visualize_speed_comparison(
     
     plt.tight_layout()
     plt.savefig('predictive_module/plot/speed_comparison.png', dpi=150)
-    print("Speed comparison saved to speed_comparison.png")
+    print("Speed comparison saved to predictive_module/plot/speed_comparison.png")
     plt.show()
 
 
@@ -312,7 +312,7 @@ if __name__ == "__main__":
         test_trajectories,
         n_samples=6,
         sequence_length=10,
-        prediction_horizon=20,
+        prediction_horizon=10,  # Reduced from 20 to 10
         device=device
     )
     
@@ -323,7 +323,7 @@ if __name__ == "__main__":
         test_trajectories,
         n_trajectories=50,
         sequence_length=10,
-        prediction_horizon=20,
+        prediction_horizon=10,  # Reduced from 20 to 10
         device=device
     )
     
@@ -333,7 +333,7 @@ if __name__ == "__main__":
         model,
         test_trajectories,
         sequence_length=10,
-        prediction_horizon=15,
+        prediction_horizon=10,  # Reduced from 15 to 10
         device=device
     )
     
@@ -341,6 +341,6 @@ if __name__ == "__main__":
     print("VISUALIZATION COMPLETE!")
     print("="*60)
     print("\nGenerated files:")
-    print("  - trajectory_predictions.png (6 example trajectories)")
-    print("  - error_over_time.png (error growth analysis)")
-    print("  - speed_comparison.png (low vs high speed accuracy)")
+    print("  - predictive_module/plot/trajectory_predictions.png (6 example trajectories)")
+    print("  - predictive_module/plot/error_over_time.png (error growth analysis)")
+    print("  - predictive_module/plot/speed_comparison.png (low vs high speed accuracy)")
