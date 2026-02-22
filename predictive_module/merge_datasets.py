@@ -1,78 +1,147 @@
 # merge_datasets_balanced.py
 """
 Merge ETH/UCY pedestrians with synthetic vehicles
-WITH BALANCED SAMPLING - truncates long trajectories
+WITH BALANCED SAMPLING AND 10 Hz STANDARDIZATION
 """
 
 import numpy as np
 import pickle
 import sys
 import os
+from scipy import interpolate
+from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def resample_to_10hz(traj, source_dt=0.4, target_dt=0.1):
+    """
+    Resample trajectory from 2.5 Hz (ETH/UCY) to 10 Hz
+    
+    Args:
+        traj: Trajectory array [n, 4] at 2.5 Hz
+        source_dt: Original timestep (0.4s = 2.5 Hz for ETH/UCY)
+        target_dt: Target timestep (0.1s = 10 Hz)
+    
+    Returns:
+        Resampled trajectory at 10 Hz
+    """
+    if len(traj) < 2:
+        return traj
+    
+    # Time arrays
+    t_orig = np.arange(len(traj)) * source_dt
+    t_new = np.arange(0, t_orig[-1], target_dt)
+    
+    if len(t_new) < 2:
+        return traj
+    
+    # Interpolate positions
+    f_x = interpolate.interp1d(t_orig, traj[:, 0], kind='cubic', fill_value='extrapolate')
+    f_y = interpolate.interp1d(t_orig, traj[:, 1], kind='cubic', fill_value='extrapolate')
+    
+    new_positions = np.column_stack([f_x(t_new), f_y(t_new)])
+    
+    # Calculate velocities from position changes
+    new_velocities = np.zeros_like(new_positions)
+    for i in range(len(new_positions) - 1):
+        dx = new_positions[i+1, 0] - new_positions[i, 0]
+        dy = new_positions[i+1, 1] - new_positions[i, 1]
+        new_velocities[i, 0] = dx / target_dt
+        new_velocities[i, 1] = dy / target_dt
+    
+    new_velocities[-1] = new_velocities[-2]
+    
+    return np.column_stack([new_positions, new_velocities])
+
+
 def load_eth_ucy_data(filepath='predictive_module/data/eth_ucy_processed.pkl'):
-    """Load ETH/UCY pedestrian data"""
+    """Load ETH/UCY pedestrian data and resample to 10 Hz"""
     print("Loading ETH/UCY pedestrian data...")
     
     with open(filepath, 'rb') as f:
         data = pickle.load(f)
     
     trajectories = data['trajectories']
-    stats = data.get('statistics', {})
+    print(f"  ✓ Loaded {len(trajectories)} pedestrian trajectories (2.5 Hz)")
     
-    print(f"  ✓ Loaded {len(trajectories)} pedestrian trajectories")
-    print(f"  ✓ Avg length: {stats.get('mean_length', 0):.1f} frames")
-    print(f"  ✓ Avg speed: {stats.get('mean_speed', 0):.2f} m/s")
+    # Resample to 10 Hz
+    print("  Resampling from 2.5 Hz to 10 Hz...")
+    resampled = []
+    
+    for traj in tqdm(trajectories, desc="  Resampling ETH/UCY"):
+        rs_traj = resample_to_10hz(traj, source_dt=0.4, target_dt=0.1)
+        if len(rs_traj) >= 20:
+            resampled.append(rs_traj)
+    
+    trajectories = resampled
+    
+    # Calculate statistics
+    lengths = [len(t) for t in trajectories]
+    speeds = []
+    for traj in trajectories:
+        traj_speeds = np.linalg.norm(traj[:, 2:4], axis=1)
+        speeds.extend(traj_speeds.tolist())
+    
+    speeds = np.array(speeds)
+    
+    print(f"  ✓ Resampled to {len(trajectories)} trajectories (10 Hz)")
+    print(f"  ✓ Avg length: {np.mean(lengths):.1f} frames ({np.mean(lengths)*0.1:.1f} sec)")
+    print(f"  ✓ Avg speed: {speeds.mean():.2f} m/s")
+    
+    stats = {
+        'mean_length': np.mean(lengths),
+        'mean_speed': speeds.mean(),
+        'std_speed': speeds.std()
+    }
     
     return trajectories, stats
 
 
 def load_and_truncate_vehicles(
     filepath='predictive_module/data/kgru_training_data_realistic.pkl',
-    target_length=60,
+    target_length=180,
     min_length=20
 ):
-    """
-    Load synthetic vehicles and truncate to reasonable length
-    
-    Args:
-        target_length: Target trajectory length (frames)
-        min_length: Minimum acceptable length
-    """
-    print("\nLoading and truncating synthetic vehicles...")
+    """Load synthetic vehicles at 10 Hz and truncate to reasonable length"""
+    print("\nLoading synthetic vehicles...")
     
     with open(filepath, 'rb') as f:
         data = pickle.load(f)
     
     trajectories = data['trajectories']
+    dt = data.get('dt', None)
+    
+    if dt is None:
+        print(f"  ⚠️  WARNING: dt not found in synthetic data!")
+        print(f"  Assuming dt=0.1 (check if correct)")
+        dt = 0.1
+    elif dt != 0.1:
+        print(f"  ⚠️  WARNING: Expected dt=0.1, got dt={dt}")
+        print(f"  Data may not be at 10 Hz! Recollect with fixed script.")
+        return []
+    
+    print(f"  ✓ Data timestep: {dt}s ({1/dt:.0f} Hz)")
     
     # Filter and truncate vehicles
     vehicle_trajectories = []
     
     for traj in trajectories:
-        # Check if high-speed (vehicle)
         speeds = np.linalg.norm(traj[:, 2:4], axis=1)
         avg_speed = speeds.mean()
         
         if avg_speed >= 2.0:  # Vehicle threshold
-            # Truncate if too long
             if len(traj) > target_length:
-                # Random crop to avoid bias
                 max_start = len(traj) - target_length
                 start_idx = np.random.randint(0, max_start + 1)
                 truncated = traj[start_idx:start_idx + target_length]
                 vehicle_trajectories.append(truncated)
             elif len(traj) >= min_length:
-                # Keep as is if already reasonable length
                 vehicle_trajectories.append(traj)
     
-    print(f"  ✓ Total synthetic trajectories: {len(trajectories)}")
     print(f"  ✓ High-speed vehicles extracted: {len(vehicle_trajectories)}")
-    print(f"  ✓ Truncated to max {target_length} frames")
+    print(f"  ✓ Truncated to max {target_length} frames ({target_length*0.1:.1f} sec)")
     
-    # Calculate statistics
     if len(vehicle_trajectories) > 0:
         lengths = [len(v) for v in vehicle_trajectories]
         speeds = []
@@ -81,7 +150,7 @@ def load_and_truncate_vehicles(
             speeds.extend(traj_speeds.tolist())
         
         speeds = np.array(speeds)
-        print(f"  ✓ Avg length: {np.mean(lengths):.1f} frames")
+        print(f"  ✓ Avg length: {np.mean(lengths):.1f} frames ({np.mean(lengths)*0.1:.1f} sec)")
         print(f"  ✓ Avg speed: {speeds.mean():.2f} m/s")
     
     return vehicle_trajectories
@@ -89,65 +158,61 @@ def load_and_truncate_vehicles(
 
 def create_balanced_hybrid_dataset(
     pedestrian_ratio=0.7,
-    vehicle_target_length=60,
+    vehicle_target_length=180,
     save_path='predictive_module/data/kgru_training_data_hybrid.pkl'
 ):
-    """
-    Create BALANCED hybrid dataset
-    
-    Key improvement: Truncates vehicle trajectories to match pedestrian length
-    """
+    """Create BALANCED hybrid dataset at 10 Hz"""
     
     print("="*60)
-    print("CREATING BALANCED HYBRID DATASET")
+    print("CREATING BALANCED HYBRID DATASET (10 Hz)")
     print("="*60)
-    print(f"Target: {pedestrian_ratio*100:.0f}% ped / {(1-pedestrian_ratio)*100:.0f}% veh (by trajectory)")
-    print(f"Vehicle max length: {vehicle_target_length} frames")
+    print(f"Target: {pedestrian_ratio*100:.0f}% ped / {(1-pedestrian_ratio)*100:.0f}% veh")
+    print(f"Frequency: 10 Hz (dt = 0.1s)")
     print()
     
-    # Load pedestrians
+    # Load pedestrians (resampled to 10 Hz)
     pedestrians, ped_stats = load_eth_ucy_data()
     
-    # Load and truncate vehicles
+    # Load vehicles (already at 10 Hz)
     vehicles = load_and_truncate_vehicles(
         target_length=vehicle_target_length,
         min_length=20
     )
     
     if len(vehicles) == 0:
-        print("\n⚠️ No vehicles available, using pedestrians only")
-        all_trajectories = pedestrians
-        composition = {'pedestrians': len(pedestrians), 'vehicles': 0}
+        print("\n⚠️ No vehicles available!")
+        print("Run: python data_collection_realistic.py")
+        return None, None
+    
+    # Calculate target counts
+    n_peds = len(pedestrians)
+    n_vehs_target = int(n_peds * (1 - pedestrian_ratio) / pedestrian_ratio)
+    
+    print(f"\nTarget composition:")
+    print(f"  Pedestrians: {n_peds}")
+    print(f"  Vehicles: {n_vehs_target}")
+    
+    # Sample vehicles
+    if n_vehs_target > len(vehicles):
+        print(f"  Oversampling vehicles ({len(vehicles)} → {n_vehs_target})")
+        indices = np.random.choice(len(vehicles), n_vehs_target, replace=True)
     else:
-        # Calculate target counts
-        n_peds = len(pedestrians)
-        n_vehs_target = int(n_peds * (1 - pedestrian_ratio) / pedestrian_ratio)
-        
-        print(f"\nTarget composition:")
-        print(f"  Pedestrians: {n_peds}")
-        print(f"  Vehicles: {n_vehs_target}")
-        
-        # Sample vehicles
-        if n_vehs_target > len(vehicles):
-            print(f"  ⚠️ Oversampling vehicles ({len(vehicles)} → {n_vehs_target})")
-            indices = np.random.choice(len(vehicles), n_vehs_target, replace=True)
-        else:
-            indices = np.random.choice(len(vehicles), n_vehs_target, replace=False)
-        
-        sampled_vehicles = [vehicles[i] for i in indices]
-        
-        # Combine
-        all_trajectories = pedestrians + sampled_vehicles
-        np.random.shuffle(all_trajectories)
-        
-        composition = {
-            'pedestrians': n_peds,
-            'vehicles': len(sampled_vehicles)
-        }
+        indices = np.random.choice(len(vehicles), n_vehs_target, replace=False)
+    
+    sampled_vehicles = [vehicles[i] for i in indices]
+    
+    # Combine
+    all_trajectories = pedestrians + sampled_vehicles
+    np.random.shuffle(all_trajectories)
+    
+    composition = {
+        'pedestrians': n_peds,
+        'vehicles': len(sampled_vehicles)
+    }
     
     # Calculate statistics
     print("\n" + "="*60)
-    print("BALANCED DATASET STATISTICS")
+    print("BALANCED DATASET STATISTICS (10 Hz)")
     print("="*60)
     
     lengths = [len(traj) for traj in all_trajectories]
@@ -167,8 +232,8 @@ def create_balanced_hybrid_dataset(
     print(f"  Pedestrians: {n_peds} ({n_peds/n_total*100:.1f}%)")
     print(f"  Vehicles: {n_vehs} ({n_vehs/n_total*100:.1f}%)")
     
-    print(f"\nTrajectory Length:")
-    print(f"  Mean: {np.mean(lengths):.1f} frames ({np.mean(lengths)*0.4:.1f} sec)")
+    print(f"\nTrajectory Length (10 Hz):")
+    print(f"  Mean: {np.mean(lengths):.1f} frames ({np.mean(lengths)*0.1:.1f} sec)")
     print(f"  Range: {np.min(lengths)} - {np.max(lengths)} frames")
     
     # Sample distribution
@@ -183,7 +248,6 @@ def create_balanced_hybrid_dataset(
     print(f"\nSpeed Statistics:")
     print(f"  Mean: {all_speeds.mean():.2f} m/s")
     print(f"  Std: {all_speeds.std():.2f} m/s")
-    print(f"  Range: {all_speeds.min():.2f} - {all_speeds.max():.2f} m/s")
     
     # Check balance
     sample_ratio = n_low / len(all_speeds)
@@ -194,16 +258,17 @@ def create_balanced_hybrid_dataset(
     print(f"  Sample ratio (low-speed): {sample_ratio*100:.1f}%")
     
     if abs(traj_ratio - sample_ratio) < 0.15:
-        print(f"  ✅ BALANCED! (difference < 15%)")
+        print(f"  ✅ BALANCED!")
     else:
-        print(f"  ⚠️ Imbalanced (difference {abs(traj_ratio-sample_ratio)*100:.1f}%)")
+        print(f"  ⚠️ Imbalanced (diff {abs(traj_ratio-sample_ratio)*100:.1f}%)")
     
     # Save
     data = {
         'trajectories': all_trajectories,
-        'source': 'Balanced Hybrid: ETH/UCY + Synthetic (truncated)',
+        'dt': 0.1,  # CRITICAL!
+        'frequency': '10 Hz',
+        'source': 'Balanced Hybrid: ETH/UCY (resampled to 10 Hz) + Synthetic (10 Hz)',
         'composition': composition,
-        'vehicle_truncation': vehicle_target_length,
         'statistics': {
             'n_trajectories': n_total,
             'mean_length': np.mean(lengths),
@@ -211,7 +276,6 @@ def create_balanced_hybrid_dataset(
             'std_speed': all_speeds.std(),
             'low_speed_pct': sample_ratio * 100,
             'high_speed_pct': (1 - sample_ratio) * 100,
-            'balance_score': 1 - abs(traj_ratio - sample_ratio)
         }
     }
     
@@ -220,7 +284,7 @@ def create_balanced_hybrid_dataset(
     
     size_mb = os.path.getsize(save_path) / 1024 / 1024
     
-    print(f"\n✅ Balanced dataset saved!")
+    print(f"\n✅ Balanced 10 Hz dataset saved!")
     print(f"   Path: {save_path}")
     print(f"   Size: {size_mb:.1f} MB")
     
@@ -230,12 +294,12 @@ def create_balanced_hybrid_dataset(
 if __name__ == "__main__":
     trajectories, stats = create_balanced_hybrid_dataset(
         pedestrian_ratio=0.7,
-        vehicle_target_length=60,  # Match pedestrian avg length
+        vehicle_target_length=180,
         save_path='predictive_module/data/kgru_training_data_hybrid.pkl'
     )
     
-    if len(trajectories) > 0:
+    if trajectories is not None:
         print("\n" + "="*60)
-        print("✅ READY FOR TRAINING!")
+        print("✅ READY FOR TRAINING AT 10 Hz!")
         print("="*60)
-        print("\nNext: python3 predictive_module/train_kgru.py")
+        print("\nNext: python train_kgru.py")

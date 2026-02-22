@@ -24,7 +24,7 @@ class KGRUPredictor:
     def __init__(
         self,
         history_length=10,
-        dt=0.002,  # Timestep (from MuJoCo)
+        dt=0.1,  # Timestep (from MuJoCo)
         low_speed_threshold=0.2,
         high_speed_threshold=1.1,
         device='cuda' if torch.cuda.is_available() else 'cpu'
@@ -38,9 +38,10 @@ class KGRUPredictor:
         # GRU network
         self.gru_model = TrajectoryGRU(
             input_size=4,
-            hidden_size=50,
-            num_layers=2,
-            output_size=4
+            hidden_size=128,
+            num_layers=3,
+            output_size=4,
+            dropout=0.2
         ).to(device)
         
         # K-means clusterer
@@ -111,43 +112,58 @@ class KGRUPredictor:
     
     def classify_speeds(self, obstacle_states):
         """
-        K-means clustering to classify obstacles into low/high speed groups
+        K-means clustering to discover natural speed groups
+        
+        TRUE K-means: Discovers boundary from data, not manual threshold!
         
         Returns:
-            low_speed_ids: List of obstacle IDs in low-speed group
-            high_speed_ids: List of obstacle IDs in high-speed group
+            low_speed_ids: List of obstacle IDs in discovered low-speed group
+            high_speed_ids: List of obstacle IDs in discovered high-speed group
+            boundary: Discovered speed boundary
         """
         if len(obstacle_states) < 2:
             # Not enough obstacles for clustering
+            # Use single obstacle's speed vs median of history
             speeds = [np.linalg.norm(obs['vel']) for obs in obstacle_states]
             ids = [obs['id'] for obs in obstacle_states]
             
-            low_speed_ids = [id for id, s in zip(ids, speeds) if s < self.high_speed_threshold]
-            high_speed_ids = [id for id, s in zip(ids, speeds) if s >= self.high_speed_threshold]
-            return low_speed_ids, high_speed_ids
+            # Default boundary if we have history
+            if hasattr(self, 'discovered_boundary'):
+                boundary = self.discovered_boundary
+            else:
+                boundary = 2.0  # Fallback only
+            
+            low_speed_ids = [id for id, s in zip(ids, speeds) if s < boundary]
+            high_speed_ids = [id for id, s in zip(ids, speeds) if s >= boundary]
+            return low_speed_ids, high_speed_ids, boundary
         
         # Extract velocities for clustering
         velocities = np.array([obs['vel'] for obs in obstacle_states])
         speeds = np.linalg.norm(velocities, axis=1).reshape(-1, 1)
         
-        # K-means clustering
+        # K-means clustering - DISCOVERS the grouping!
         labels = self.kmeans.fit_predict(speeds)
         
         # Determine which cluster is low-speed vs high-speed
         cluster_means = [speeds[labels == i].mean() for i in range(2)]
         low_cluster = 0 if cluster_means[0] < cluster_means[1] else 1
+        high_cluster = 1 - low_cluster
         
-        # Separate obstacle IDs
+        # Calculate discovered boundary
+        centers = self.kmeans.cluster_centers_.flatten()
+        self.discovered_boundary = (centers[0] + centers[1]) / 2
+        
+        # Separate obstacle IDs based on K-means labels
         low_speed_ids = [obs['id'] for obs, label in zip(obstacle_states, labels) 
                         if label == low_cluster]
         high_speed_ids = [obs['id'] for obs, label in zip(obstacle_states, labels) 
-                         if label != low_cluster]
+                        if label == high_cluster]
         
-        return low_speed_ids, high_speed_ids
+        return low_speed_ids, high_speed_ids, self.discovered_boundary
     
     def predict(self, obstacle_states, prediction_horizon=5):
         """
-        Predict future trajectories for all obstacles
+        Predict future trajectories for all obstacles using K-means clustering
         
         Args:
             obstacle_states: Current obstacle observations
@@ -155,13 +171,13 @@ class KGRUPredictor:
             
         Returns:
             predictions: Dict mapping obstacle_id -> predicted trajectory
-                        Each trajectory is array of shape (horizon, 4) = [x, y, vx, vy]
+            boundary: K-means discovered speed boundary (for analysis)
         """
         # Update with current observations
         self.update(obstacle_states)
         
-        # Classify into speed groups
-        low_speed_ids, high_speed_ids = self.classify_speeds(obstacle_states)
+        # Classify into speed groups using K-means
+        low_speed_ids, high_speed_ids, boundary = self.classify_speeds(obstacle_states)
         
         predictions = {}
         
@@ -177,7 +193,7 @@ class KGRUPredictor:
                 trajectory = self._predict_gru(obs_id, prediction_horizon)
                 predictions[obs_id] = trajectory
         
-        return predictions
+        return predictions, boundary
     
     def _predict_gru(self, obs_id, horizon):
         """

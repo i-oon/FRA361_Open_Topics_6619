@@ -17,6 +17,7 @@ except ImportError:
     VIEWER_AVAILABLE = False
     print("Install viewer: pip install mujoco-python-viewer")
 
+
 class DynamicObstacleNavEnv(gym.Env):
     """
     Omni-directional robot navigation with dynamic obstacles
@@ -26,6 +27,7 @@ class DynamicObstacleNavEnv(gym.Env):
     - Collision detection
     - Goal reaching
     - State logging for prediction training
+    - NO automatic episode termination (controlled by caller)
     """
     
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
@@ -36,8 +38,18 @@ class DynamicObstacleNavEnv(gym.Env):
         n_obstacles: int = 5,
         low_speed_ratio: float = 0.5,
         render_mode: Optional[str] = None,
-        max_episode_steps: int = 1000,
     ):
+        """
+        Initialize environment
+        
+        Args:
+            model_path: Path to MuJoCo XML model
+            n_obstacles: Number of dynamic obstacles
+            low_speed_ratio: Ratio of low-speed to total obstacles
+            render_mode: Rendering mode ('human', 'rgb_array', or None)
+        
+        Note: NO max_episode_steps parameter - caller controls episode length!
+        """
         super().__init__()
         
         # Load MuJoCo model
@@ -48,12 +60,11 @@ class DynamicObstacleNavEnv(gym.Env):
         # Environment parameters
         self.n_obstacles = n_obstacles
         self.low_speed_ratio = low_speed_ratio
-        self.max_episode_steps = max_episode_steps
         self.current_step = 0
         
         # Speed groups
-        self.low_speed_range = (0.1, 0.3)
-        self.high_speed_range = (0.5, 1.0)
+        self.low_speed_range = (0.5, 1.5)
+        self.high_speed_range = (2.5, 4.5)
         
         # Arena boundaries
         self.arena_size = 10.0
@@ -62,7 +73,7 @@ class DynamicObstacleNavEnv(gym.Env):
         self.robot_radius = 0.25
         self.goal_threshold = 0.3
         
-        # Action space
+        # Action space: [vx, vy, omega]
         self.action_space = spaces.Box(
             low=np.array([-0.5, -0.5, -1.5]),
             high=np.array([0.5, 0.5, 1.5]),
@@ -70,29 +81,8 @@ class DynamicObstacleNavEnv(gym.Env):
         )
         
         # Observation space
-        obs_dim = 10 + n_obstacles * 5
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
-        )
-        
-        # Initialize obstacles
-        self.obstacles = self._init_obstacles()
-        
-        # Viewer - INITIALIZE THIS FIRST!
-        self.viewer = None
-        
-        # Data logging
-        self.episode_data = {
-            'robot_states': [],
-            'obstacle_states': [],
-            'actions': [],
-            'rewards': []
-        }
-    
-    def close(self):
-        if self.viewer is not None:
-            self.viewer.close()
-            self.viewer = Noneal_angle,
+        # [robot_x, robot_y, robot_theta, robot_vx, robot_vy, robot_omega,
+        #  goal_x, goal_y, goal_dist, goal_angle,
         #  obs1_rel_x, obs1_rel_y, obs1_vx, obs1_vy, obs1_speed,
         #  ... (repeat for each obstacle)]
         obs_dim = 10 + n_obstacles * 5
@@ -100,8 +90,9 @@ class DynamicObstacleNavEnv(gym.Env):
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
         
-        # Initialize obstacles
-        self.obstacles = self._init_obstacles()
+        # Initialize obstacles (will be reset properly in reset())
+        self.obstacles = []
+        self.goal = np.zeros(2)
         
         # Viewer
         self.viewer = None
@@ -113,18 +104,31 @@ class DynamicObstacleNavEnv(gym.Env):
             'actions': [],
             'rewards': []
         }
+    
+    def _init_obstacles(self, robot_pos: np.ndarray):
+        """
+        Initialize obstacles with speed groups
+        Ensures minimum distance from robot
         
-    def _init_obstacles(self):
-        """Initialize obstacles with speed groups"""
+        Args:
+            robot_pos: Current robot position to avoid spawning on top of robot
+        """
         n_low = int(self.n_obstacles * self.low_speed_ratio)
         n_high = self.n_obstacles - n_low
         
         obstacles = []
+        min_dist_from_robot = 1.5  # meters
         
         # Low-speed obstacles
         for i in range(n_low):
+            # Find position away from robot
+            while True:
+                pos = np.random.uniform(-self.arena_size/2, self.arena_size/2, 2)
+                if np.linalg.norm(pos - robot_pos) > min_dist_from_robot:
+                    break
+            
             obs = {
-                'pos': np.random.uniform(-self.arena_size/2, self.arena_size/2, 2),
+                'pos': pos,
                 'vel': np.random.uniform(*self.low_speed_range) * self._random_direction(),
                 'radius': 0.3,
                 'speed_group': 'low'
@@ -133,8 +137,14 @@ class DynamicObstacleNavEnv(gym.Env):
         
         # High-speed obstacles
         for i in range(n_high):
+            # Find position away from robot
+            while True:
+                pos = np.random.uniform(-self.arena_size/2, self.arena_size/2, 2)
+                if np.linalg.norm(pos - robot_pos) > min_dist_from_robot:
+                    break
+            
             obs = {
-                'pos': np.random.uniform(-self.arena_size/2, self.arena_size/2, 2),
+                'pos': pos,
                 'vel': np.random.uniform(*self.high_speed_range) * self._random_direction(),
                 'radius': 0.3,
                 'speed_group': 'high'
@@ -149,6 +159,13 @@ class DynamicObstacleNavEnv(gym.Env):
         return np.array([np.cos(angle), np.sin(angle)])
     
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+        """
+        Reset environment
+        
+        Returns:
+            obs: Initial observation
+            info: Additional info
+        """
         super().reset(seed=seed)
         
         # Reset MuJoCo simulation
@@ -157,7 +174,11 @@ class DynamicObstacleNavEnv(gym.Env):
         # Reset robot position (random start)
         robot_start = np.random.uniform(-3, 3, 2)
         self.data.qpos[0:2] = robot_start
-        self.data.qpos[3:7] = [1, 0, 0, 0]  # quaternion
+        self.data.qpos[2] = 0.0  # z position
+        self.data.qpos[3:7] = [1, 0, 0, 0]  # quaternion (no rotation)
+        
+        # Reset velocities
+        self.data.qvel[:] = 0.0
         
         # Set goal (random, but far from start)
         while True:
@@ -165,28 +186,22 @@ class DynamicObstacleNavEnv(gym.Env):
             if np.linalg.norm(self.goal - robot_start) > 2.0:  # At least 2m away
                 break
         
-        # Reset obstacles (ensure minimum distance from robot)
-        self.obstacles = []
-        while len(self.obstacles) < self.n_obstacles:
-            obs_pos = np.random.uniform(-self.arena_size/2, self.arena_size/2, 2)
-            
-            # Check minimum distance from robot (1.5m)
-            if np.linalg.norm(obs_pos - robot_start) > 1.5:
-                # Determine speed group
-                is_low_speed = len(self.obstacles) < int(self.n_obstacles * self.low_speed_ratio)
-                speed_range = self.low_speed_range if is_low_speed else self.high_speed_range
-                
-                obs = {
-                    'pos': obs_pos,
-                    'vel': np.random.uniform(*speed_range) * self._random_direction(),
-                    'radius': 0.3,
-                    'speed_group': 'low' if is_low_speed else 'high'
-                }
-                self.obstacles.append(obs)
+        # Initialize obstacles (with minimum distance from robot)
+        self.obstacles = self._init_obstacles(robot_start)
         
-        # Rest of reset...
+        # Reset step counter
         self.current_step = 0
-        self.episode_data = {'robot_states': [], 'obstacle_states': [], 'actions': [], 'rewards': []}
+        
+        # Reset data logging
+        self.episode_data = {
+            'robot_states': [],
+            'obstacle_states': [],
+            'actions': [],
+            'rewards': []
+        }
+        
+        # Forward simulation to stabilize
+        mujoco.mj_forward(self.model, self.data)
         
         obs = self._get_obs()
         info = self._get_info()
@@ -194,6 +209,19 @@ class DynamicObstacleNavEnv(gym.Env):
         return obs, info
     
     def step(self, action):
+        """
+        Step simulation
+        
+        Args:
+            action: [vx, vy, omega] robot control
+        
+        Returns:
+            obs: Observation
+            reward: Reward
+            terminated: Whether episode ended (collision or goal)
+            truncated: Whether episode was truncated (NOT USED - caller controls length)
+            info: Additional info
+        """
         # Apply action to robot
         self.data.ctrl[:] = action
         
@@ -209,24 +237,34 @@ class DynamicObstacleNavEnv(gym.Env):
         # Calculate reward
         reward, reward_info = self._calculate_reward()
         
-        # Check termination
-        terminated = self._check_collision() or self._check_goal_reached()
-        truncated = self.current_step >= self.max_episode_steps
+        # Check termination (ONLY collision or goal - NO time limit!)
+        collision = self._check_collision()
+        goal_reached = self._check_goal_reached()
+        terminated = collision or goal_reached
+        
+        # NO truncation - caller controls episode length
+        truncated = False
         
         # Log data
         self._log_step(obs, action, reward)
         
         self.current_step += 1
         
+        # Build info
         info = self._get_info()
         info.update(reward_info)
-        info['collision'] = self._check_collision()
-        info['goal_reached'] = self._check_goal_reached()
+        info['collision'] = collision
+        info['goal_reached'] = goal_reached
         
         return obs, reward, terminated, truncated, info
     
     def _get_obs(self):
-        """Get observation"""
+        """
+        Get observation
+        
+        Returns:
+            obs: [robot_state (10), obstacle_states (n_obstacles × 5)]
+        """
         # Robot state
         robot_pos = self.data.qpos[0:2]
         robot_theta = self._get_robot_theta()
@@ -283,10 +321,6 @@ class DynamicObstacleNavEnv(gym.Env):
                     obs['pos'][i] = np.sign(obs['pos'][i]) * self.arena_size/2
                     obs['vel'][i] *= -1
             
-            # Occasional direction change (adds unpredictability)
-            if np.random.random() < 0.005:  # 0.5% chance per step
-                obs['vel'] = np.linalg.norm(obs['vel']) * self._random_direction()
-    
     def _calculate_reward(self):
         """Calculate reward"""
         robot_pos = self.data.qpos[0:2]
@@ -312,7 +346,6 @@ class DynamicObstacleNavEnv(gym.Env):
         reward += -0.01
         
         # Risk penalty (anticipatory - for later use with prediction)
-        # This is where your K-GRU predictions will plug in
         risk_penalty = self._calculate_risk_penalty()
         reward += risk_penalty
         reward_info['risk_penalty'] = risk_penalty
@@ -322,7 +355,6 @@ class DynamicObstacleNavEnv(gym.Env):
     def _calculate_risk_penalty(self):
         """Calculate risk based on proximity to obstacles"""
         robot_pos = self.data.qpos[0:2]
-        robot_vel = self.data.qvel[0:2]
         
         risk = 0.0
         safety_dist = 1.0  # meters
@@ -380,6 +412,7 @@ class DynamicObstacleNavEnv(gym.Env):
         }
     
     def render(self):
+        """Render environment"""
         if self.render_mode == "human" and VIEWER_AVAILABLE:
             if self.viewer is None:
                 self.viewer = mujoco_viewer.MujocoViewer(self.model, self.data)
@@ -391,6 +424,7 @@ class DynamicObstacleNavEnv(gym.Env):
             self.viewer.render()
     
     def close(self):
+        """Clean up resources"""
         if self.viewer is not None:
             self.viewer.close()
             self.viewer = None

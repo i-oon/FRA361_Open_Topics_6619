@@ -14,49 +14,7 @@ from tqdm import tqdm
 import pickle
 
 
-def add_realistic_dynamics(base_speed, obstacle_type, step):
-    """
-    Add realistic motion patterns based on obstacle type
-    
-    Args:
-        base_speed: Base speed from environment
-        obstacle_type: 'pedestrian' or 'vehicle'
-        step: Current step number
-    
-    Returns:
-        Modified speed with realistic characteristics
-    """
-    if obstacle_type == 'pedestrian':
-        # Pedestrians: more variable, occasional stops
-        if np.random.random() < 0.05:  # 5% chance to stop
-            return 0.0
-        
-        # Speed variations (walking rhythm)
-        speed_variation = np.random.normal(0, 0.15)
-        modified_speed = base_speed * (1.0 + speed_variation)
-        
-        # Clamp to pedestrian range (0.8-1.5 m/s)
-        return np.clip(modified_speed, 0.8, 1.5)
-    
-    else:  # vehicle
-        # Vehicles: more consistent speed
-        speed_variation = np.random.normal(0, 0.05)
-        modified_speed = base_speed * (1.0 + speed_variation)
-        
-        # Clamp to vehicle range (2.0-4.0 m/s)
-        return np.clip(modified_speed, 2.0, 4.0)
-
-
 def add_sensor_noise(state):
-    """
-    Add realistic sensor noise to state
-    
-    Args:
-        state: [x, y, vx, vy]
-    
-    Returns:
-        Noisy state
-    """
     noisy_state = state.copy()
     
     # Position noise: ±3cm std
@@ -69,19 +27,7 @@ def add_sensor_noise(state):
 
 
 def extract_obstacle_states(obs, n_obstacles):
-    """
-    Extract obstacle states from environment observation
-    
-    Assumes observation format: [robot_state, goal, obstacle_states...]
-    Obstacle state: [x, y, vx, vy] per obstacle
-    
-    Args:
-        obs: Full observation from environment
-        n_obstacles: Number of obstacles
-    
-    Returns:
-        List of obstacle states, each [x, y, vx, vy]
-    """
+
     # Skip robot state (3: x, y, theta) and goal (2: x, y)
     robot_and_goal_dim = 5
     
@@ -99,9 +45,45 @@ def extract_obstacle_states(obs, n_obstacles):
     return obstacle_states
 
 
+def downsample_trajectories(trajectories, target_dt=0.1, source_dt=0.002):
+    factor = int(target_dt / source_dt)  # 50
+    
+    print(f"\nDownsampling trajectories:")
+    print(f"  From: {source_dt}s ({1/source_dt:.0f} Hz)")
+    print(f"  To:   {target_dt}s ({1/target_dt:.0f} Hz)")
+    print(f"  Factor: {factor}")
+    
+    downsampled = []
+    
+    for traj in tqdm(trajectories, desc="  Downsampling"):
+        # Check BEFORE downsampling
+        if len(traj) < factor * 10:  # Need at least 10 frames after downsampling
+            continue
+        
+        # Downsample
+        ds_traj = traj[::factor].copy()
+        
+        # Recalculate velocities
+        for i in range(len(ds_traj) - 1):
+            dx = ds_traj[i+1, 0] - ds_traj[i, 0]
+            dy = ds_traj[i+1, 1] - ds_traj[i, 1]
+            ds_traj[i, 2] = dx / target_dt
+            ds_traj[i, 3] = dy / target_dt
+        
+        ds_traj[-1, 2:4] = ds_traj[-2, 2:4]
+        
+        # Should have at least 10 frames now
+        if len(ds_traj) >= 10:  # ← 10 frames = 1 second
+            downsampled.append(ds_traj)
+    
+    print(f"  Kept {len(downsampled)}/{len(trajectories)} trajectories")
+    
+    return downsampled
+
+
 def collect_realistic_training_data(
     n_episodes=500,
-    max_steps=2000,
+    max_steps=10000,
     save_path='predictive_module/data/kgru_training_data_realistic.pkl'
 ):
     """
@@ -156,6 +138,7 @@ def collect_realistic_training_data(
             
             # Store trajectories for each obstacle
             episode_trajectories = {i: [] for i in range(n_obs)}
+            termination_reasons = []  # Add before the for episode loop
             
             for step in range(max_steps):
                 # Extract obstacle states from observation
@@ -174,47 +157,34 @@ def collect_realistic_training_data(
                 obs, reward, terminated, truncated, info = env.step(action)
                 
                 if terminated or truncated:
+                    reason = f"Step {step}: terminated={terminated}, truncated={truncated}"
+                    if 'TimeLimit.truncated' in info:
+                        reason += " (TimeLimit)"
+                    termination_reasons.append(reason)
                     break
             
-            # Post-process trajectories to match expected speed profiles
+            # Collect trajectories (minimum length check)
             for obs_id, trajectory in episode_trajectories.items():
-                if len(trajectory) >= 20:
+                if len(trajectory) >= 100:  # At 500 Hz, need 100 samples minimum
                     trajectory = np.array(trajectory)
-                    
-                    # Calculate average speed
-                    speeds = np.linalg.norm(trajectory[:, 2:4], axis=1)
-                    avg_speed = speeds.mean()
-                    
-                    # Determine type based on speed (environment's natural speeds)
-                    # If avg speed < 1.0 m/s, treat as pedestrian
-                    # Otherwise treat as vehicle
-                    obs_type = obstacle_types[obs_id % len(obstacle_types)]
-                    
-                    # Adjust speeds to match realistic profiles
-                    for t in range(len(trajectory)):
-                        current_speed = np.linalg.norm(trajectory[t, 2:4])
-                        
-                        if current_speed > 0.01:  # Avoid division by zero
-                            if obs_type == 'pedestrian':
-                                # Scale to pedestrian speeds (0.8-1.5 m/s)
-                                target_speed = np.random.uniform(0.8, 1.5)
-                            else:
-                                # Scale to vehicle speeds (2.0-4.0 m/s)
-                                target_speed = np.random.uniform(2.0, 4.0)
-                            
-                            # Random stops for pedestrians
-                            if obs_type == 'pedestrian' and np.random.random() < 0.03:
-                                target_speed = 0.0
-                            
-                            # Scale velocity
-                            scale_factor = target_speed / current_speed
-                            trajectory[t, 2:4] *= scale_factor
-                    
                     all_trajectories.append(trajectory)
             
             env.close()
+            if episode == 0 and config_idx == 0:  # Print first episode only
+                print(f"\nExample terminations:")
+                for r in termination_reasons[:5]:
+                    print(f"  {r}")
     
-    # Statistics
+    print(f"\nCollected {len(all_trajectories)} raw trajectories at 500 Hz")
+    
+    # CRITICAL FIX: Downsample to 10 Hz before saving
+    all_trajectories = downsample_trajectories(
+        all_trajectories, 
+        target_dt=0.1, 
+        source_dt=0.002
+    )
+    
+    # Calculate statistics on downsampled data
     trajectory_lengths = [len(traj) for traj in all_trajectories]
     speeds = []
     for traj in all_trajectories:
@@ -225,15 +195,18 @@ def collect_realistic_training_data(
     low_speed_pct = (speeds < 2.0).sum() / len(speeds) * 100
     high_speed_pct = (speeds >= 2.0).sum() / len(speeds) * 100
     
-    # Save data
+    # Save data with correct dt
     data = {
         'trajectories': all_trajectories,
+        'dt': 0.1,  # CRITICAL: Store the timestep!
+        'source_frequency': '10 Hz (downsampled from 500 Hz)',
         'configurations': configurations,
         'motion_model_params': {
             'pedestrian_speed_range': (0.8, 1.5),
             'vehicle_speed_range': (2.0, 4.0),
             'position_noise_std': 0.03,
             'velocity_noise_std': 0.05,
+            'timestep': 0.1,
         },
         'statistics': {
             'n_trajectories': len(all_trajectories),
@@ -254,8 +227,9 @@ def collect_realistic_training_data(
     print("\n" + "="*60)
     print("DATA COLLECTION COMPLETE")
     print("="*60)
+    print(f"Frequency: 10 Hz (dt = 0.1s)")
     print(f"Total trajectories: {len(all_trajectories)}")
-    print(f"Average length: {np.mean(trajectory_lengths):.1f} steps")
+    print(f"Average length: {np.mean(trajectory_lengths):.1f} steps ({np.mean(trajectory_lengths) * 0.1:.1f} seconds)")
     print(f"Speed distribution:")
     print(f"  Low-speed (<2.0 m/s): {low_speed_pct:.1f}%")
     print(f"  High-speed (≥2.0 m/s): {high_speed_pct:.1f}%")
@@ -264,10 +238,9 @@ def collect_realistic_training_data(
     print(f"\nData saved to: {save_path}")
     print("="*60)
 
-
 if __name__ == "__main__":
     collect_realistic_training_data(
         n_episodes=500,
-        max_steps=2000,
+        max_steps=10000,
         save_path='predictive_module/data/kgru_training_data_realistic.pkl'
     )

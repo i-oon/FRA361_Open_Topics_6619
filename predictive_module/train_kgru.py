@@ -97,8 +97,8 @@ def train_model(
     
     model = TrajectoryGRU(
         input_size=4,
-        hidden_size=50,
-        num_layers=2,
+        hidden_size=128,
+        num_layers=3,
         output_size=4
     ).to(device)
     
@@ -288,10 +288,89 @@ def evaluate_predictions(model, test_loader, device='cuda', save_plots=True):
     return ade, fde, vel_error
 
 
+def analyze_kmeans_clustering(train_trajectories):
+    """
+    Analyze K-means clustering on training data
+    Validates that K-means discovers natural speed boundaries
+    """
+    print("\n" + "="*60)
+    print("K-MEANS CLUSTERING VALIDATION")
+    print("="*60)
+    
+    # Extract speeds from training trajectories
+    all_speeds = []
+    for traj in train_trajectories:
+        speeds = np.linalg.norm(traj[:, 2:4], axis=1)
+        all_speeds.append(speeds.mean())
+    
+    all_speeds = np.array(all_speeds).reshape(-1, 1)
+    
+    # K-means clustering (discovers natural grouping)
+    from sklearn.cluster import KMeans
+    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(all_speeds)
+    
+    # Analyze discovered clusters
+    centers = kmeans.cluster_centers_.flatten()
+    low_center = centers.min()
+    high_center = centers.max()
+    discovered_boundary = (low_center + high_center) / 2
+    
+    # Determine which cluster is low vs high
+    low_cluster = 0 if centers[0] < centers[1] else 1
+    high_cluster = 1 - low_cluster
+    
+    n_low = np.sum(labels == low_cluster)
+    n_high = np.sum(labels == high_cluster)
+    
+    print(f"\n✅ K-means Discovered Speed Groups:")
+    print(f"  Low-speed cluster:")
+    print(f"    Center: {low_center:.2f} m/s")
+    print(f"    Count: {n_low} ({n_low/len(labels)*100:.1f}%)")
+    print(f"  High-speed cluster:")
+    print(f"    Center: {high_center:.2f} m/s")
+    print(f"    Count: {n_high} ({n_high/len(labels)*100:.1f}%)")
+    print(f"  Discovered boundary: {discovered_boundary:.2f} m/s")
+    
+    # Compare to manual threshold
+    manual_threshold = 2.0
+    print(f"\n📊 Validation Against Manual Threshold:")
+    print(f"  K-means discovered: {discovered_boundary:.2f} m/s")
+    print(f"  Manual threshold: {manual_threshold:.2f} m/s")
+    print(f"  Difference: {abs(discovered_boundary - manual_threshold):.3f} m/s")
+    
+    if abs(discovered_boundary - manual_threshold) < 0.3:
+        print(f"  ✅ K-means validates bimodal assumption!")
+        print(f"     Natural boundary closely matches 2.0 m/s threshold")
+    else:
+        print(f"  ⚠️ K-means suggests different boundary: {discovered_boundary:.2f} m/s")
+        print(f"     Consider using discovered boundary for evaluation")
+    
+    # Check for severe imbalance
+    balance_ratio = min(n_low, n_high) / max(n_low, n_high)
+    print(f"\n📊 Cluster Balance:")
+    print(f"  Ratio: {balance_ratio:.2%} (minority/majority)")
+    
+    if balance_ratio < 0.1:
+        print(f"  ⚠️ SEVERE IMBALANCE! ({n_low} vs {n_high})")
+        print(f"     K-means clustering may not be beneficial")
+        print(f"     Consider regenerating data with balanced speeds")
+    elif balance_ratio < 0.3:
+        print(f"  ⚠️ Imbalanced clusters")
+        print(f"     K-means benefit may be limited")
+    else:
+        print(f"  ✅ Reasonably balanced clusters")
+        print(f"     K-means clustering is meaningful")
+    
+    print("="*60)
+    
+    return discovered_boundary, low_center, high_center
+
+
 if __name__ == "__main__":
     # Load collected data
     print("Loading training data...")
-    with open('predictive_module/data/kgru_training_data_hybrid.pkl', 'rb') as f:
+    with open('predictive_module/data/kgru_training_data_realistic.pkl', 'rb') as f:
         data = pickle.load(f)
     
     trajectories = data['trajectories']
@@ -352,6 +431,11 @@ if __name__ == "__main__":
     
     # Evaluate on test set
     ade, fde, vel_error = evaluate_predictions(model, test_loader, device=device)
+    
+    # ========== K-MEANS CLUSTERING ANALYSIS ==========
+    # Validate that K-means discovers natural speed boundaries
+    discovered_boundary, low_center, high_center = analyze_kmeans_clustering(train_data)
+    # =================================================
     
     # Plot training curves
     plt.figure(figsize=(10, 5))
