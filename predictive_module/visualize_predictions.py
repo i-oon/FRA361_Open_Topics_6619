@@ -1,6 +1,8 @@
 # visualize_predictions.py
 """
-Visualize K-GRU predictions vs ground truth trajectories
+Visualize K-GRU predictions vs ground truth trajectories.
+Supports 4 evaluation modes: 2 domain-matched + 2 cross-domain.
+K-means is computed ONCE per mode in __main__ and passed to all functions.
 """
 
 import numpy as np
@@ -13,523 +15,436 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from predictive_module.k_gru_predictor import TrajectoryGRU
+from predictive_module.utils import (
+    kmeans_speed_clusters,
+    downsample_trajectories,
+    normalize_sequence,
+)
 
-def filter_straight_walking_segments(trajectories, sequence_length=10, prediction_horizon=10):
-    """
-    Keep only test samples where person walks STRAIGHT at CONSTANT speed
-    This shows model's performance on predictable motion (not arrivals/stops)
-    """
-    straight_segments = []
-    
-    for traj in trajectories:
-        if len(traj) < sequence_length + prediction_horizon + 5:
-            continue
-        
-        # Try different starting points
-        for start_idx in range(len(traj) - sequence_length - prediction_horizon - 5):
-            # Full segment (input + prediction + buffer)
-            full_segment = traj[start_idx:start_idx+sequence_length+prediction_horizon+5]
-            
-            # Calculate velocities
-            velocities = np.diff(full_segment[:, :2], axis=0)
-            speeds = np.linalg.norm(velocities, axis=1)
-            
-            # Check speed consistency (±15% variation)
-            mean_speed = speeds.mean()
-            if mean_speed < 0.3:  # Skip very slow (standing)
-                continue
-            
-            speed_variation = np.abs(speeds - mean_speed) / mean_speed
-            speed_consistent = np.all(speed_variation < 0.15)
-            
-            # Check direction consistency (±10° variation)
-            directions = np.arctan2(velocities[:, 1], velocities[:, 0])
-            direction_changes = np.abs(np.diff(directions))
-            # Handle angle wrapping
-            direction_changes = np.minimum(direction_changes, 2*np.pi - direction_changes)
-            direction_consistent = np.all(direction_changes < 0.17)  # 10 degrees
-            
-            if speed_consistent and direction_consistent:
-                straight_segments.append(traj[start_idx:start_idx+sequence_length+prediction_horizon])
-                break  # Only take one segment per trajectory
-    
-    print(f"\n🎯 Filtered Test Set:")
-    print(f"   Original: {len(trajectories)} trajectories")
-    print(f"   Straight-walking only: {len(straight_segments)} segments")
-    print(f"   Filtered out: {len(trajectories) - len(straight_segments)} (arrivals/turns/stops)")
-    
-    return straight_segments
+
+def _apply_normalization(input_seq, ground_truth):
+    """Shift so last observed frame is at origin. Used for cross-domain only."""
+    norm_input, origin = normalize_sequence(input_seq)
+    norm_gt = ground_truth.copy()
+    norm_gt[:, 0] -= origin[0]
+    norm_gt[:, 1] -= origin[1]
+    return norm_input, norm_gt
 
 
 def visualize_trajectory_predictions(
     model,
-    trajectories,
+    valid_trajs,        # pre-filtered: len >= seq_len + horizon + 1
+    labels,             # K-means labels aligned with valid_trajs (0=low, 1=high)
+    boundary,           # K-means boundary (m/s) — for title label only
     n_samples=6,
     sequence_length=10,
     prediction_horizon=10,
-    device='cuda'
+    device='cuda',
+    save_dir='predictive_module/plot',
+    cross_domain=False,
+    mode_label='',
 ):
-    """
-    MUCH better visualization with clear error indication
-    """
-    
+    """Plot 3 low-speed + 3 high-speed examples with ground truth vs predicted."""
     model.eval()
-    
-    # Select diverse trajectories
-    selected_indices = np.linspace(0, len(trajectories)-1, n_samples, dtype=int)
-    
+
+    low_idx  = np.where(labels == 0)[0]
+    high_idx = np.where(labels == 1)[0]
+
+    # Pick as balanced as possible; if one cluster is small, fill from the other
+    half    = n_samples // 2
+    n_low   = min(half, len(low_idx))
+    n_high  = min(half, len(high_idx))
+    n_low   = min(n_low  + max(0, half - n_high), len(low_idx))
+    n_high  = min(n_high + max(0, half - n_low),  len(high_idx))
+    chosen_low  = low_idx[np.linspace(0, len(low_idx)-1,  n_low,  dtype=int)] if n_low  > 0 else np.array([], dtype=int)
+    chosen_high = high_idx[np.linspace(0, len(high_idx)-1, n_high, dtype=int)] if n_high > 0 else np.array([], dtype=int)
+    selected_indices = np.concatenate([chosen_low, chosen_high]).astype(int)
+
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     axes = axes.flatten()
-    
+
     for idx, traj_idx in enumerate(selected_indices):
-        trajectory = trajectories[traj_idx]
-        
-        if len(trajectory) < sequence_length + prediction_horizon:
-            continue
-        
+        trajectory = valid_trajs[traj_idx]
+
         max_start = len(trajectory) - sequence_length - prediction_horizon
         if max_start <= 0:
-            continue  # Skip this trajectory
+            continue
         start_idx = np.random.randint(0, max_start)
-        
-        input_seq = trajectory[start_idx:start_idx+sequence_length]
-        ground_truth = trajectory[start_idx+sequence_length:start_idx+sequence_length+prediction_horizon]
-        
-        # Predict
+
+        input_seq    = trajectory[start_idx:start_idx+sequence_length].copy()
+        ground_truth = trajectory[start_idx+sequence_length:start_idx+sequence_length+prediction_horizon].copy()
+
+        avg_speed = np.mean(np.linalg.norm(input_seq[:, 2:4], axis=1))
+
+        if cross_domain:
+            input_seq, ground_truth = _apply_normalization(input_seq, ground_truth)
+
         with torch.no_grad():
             input_tensor = torch.FloatTensor(input_seq).unsqueeze(0).to(device)
             predictions = model.predict_sequence(input_tensor, prediction_horizon)
             predictions = predictions.cpu().numpy()[0]
-        
-        avg_speed = np.mean(np.linalg.norm(input_seq[:, 2:4], axis=1))
-        
+
         ax = axes[idx]
-        
-        # 1. Plot OBSERVATION (with arrows to show direction)
+
+        # Observation arrows
         for i in range(len(input_seq)-1):
             ax.arrow(input_seq[i, 0], input_seq[i, 1],
-                    input_seq[i+1, 0] - input_seq[i, 0],
-                    input_seq[i+1, 1] - input_seq[i, 1],
-                    head_width=0.02, head_length=0.03, 
-                    fc='gray', ec='gray', alpha=0.6, linewidth=2)
-        
-        # 2. Plot GROUND TRUTH (green line with markers)
+                     input_seq[i+1, 0] - input_seq[i, 0],
+                     input_seq[i+1, 1] - input_seq[i, 1],
+                     head_width=0.02, head_length=0.03,
+                     fc='gray', ec='gray', alpha=0.6, linewidth=2)
+
         ax.plot(ground_truth[:, 0], ground_truth[:, 1],
-               'o-', color='#2ecc71', linewidth=3, markersize=6,
-               label='Ground Truth', zorder=3)
-        
-        # 3. Plot PREDICTION (red dashed line)
+                'o-', color='#2ecc71', linewidth=3, markersize=6,
+                label='Ground Truth', zorder=3)
         ax.plot(predictions[:, 0], predictions[:, 1],
-               's--', color='#e74c3c', linewidth=3, markersize=6,
-               label='Predicted', alpha=0.8, zorder=2)
-        
-        # 4. Draw ERROR LINES (connecting predicted to truth)
+                's--', color='#e74c3c', linewidth=3, markersize=6,
+                label='Predicted', alpha=0.8, zorder=2)
+
         for i in range(len(predictions)):
             ax.plot([predictions[i, 0], ground_truth[i, 0]],
-                   [predictions[i, 1], ground_truth[i, 1]],
-                   ':', color='orange', linewidth=1, alpha=0.5, zorder=1)
-        
-        # 5. Mark START clearly
-        ax.plot(input_seq[0, 0], input_seq[0, 1], 
-               'D', color='blue', markersize=12, label='Start', zorder=4)
-        
-        # 6. Mark END points
+                    [predictions[i, 1], ground_truth[i, 1]],
+                    ':', color='orange', linewidth=1, alpha=0.5, zorder=1)
+
+        ax.plot(input_seq[0, 0], input_seq[0, 1],
+                'D', color='blue', markersize=12, label='Start', zorder=4)
         ax.plot(ground_truth[-1, 0], ground_truth[-1, 1],
-               '*', color='gold', markersize=18, 
-               markeredgecolor='black', markeredgewidth=1.5,
-               label='True End', zorder=5)
+                '*', color='gold', markersize=18,
+                markeredgecolor='black', markeredgewidth=1.5,
+                label='True End', zorder=5)
         ax.plot(predictions[-1, 0], predictions[-1, 1],
-               'X', color='red', markersize=12,
-               markeredgecolor='darkred', markeredgewidth=1.5,
-               label='Pred End', zorder=5)
-        
-        # Calculate metrics
+                'X', color='red', markersize=12,
+                markeredgecolor='darkred', markeredgewidth=1.5,
+                label='Pred End', zorder=5)
+
         position_errors = np.linalg.norm(predictions[:, :2] - ground_truth[:, :2], axis=1)
         ade = position_errors.mean()
         fde = position_errors[-1]
-        
-        # Speed category
-        category = "HIGH-SPEED" if avg_speed >= 2.0 else "LOW-SPEED"
-        color = '#3498db' if avg_speed >= 2.0 else '#9b59b6'
-        
+
+        category = "HIGH-SPEED" if labels[traj_idx] == 1 else "LOW-SPEED"
+        color = '#3498db' if labels[traj_idx] == 1 else '#9b59b6'
+
         ax.set_xlabel('X Position (m)', fontsize=11, fontweight='bold')
         ax.set_ylabel('Y Position (m)', fontsize=11, fontweight='bold')
         ax.set_title(
-            f'{category}\n'
-            f'Speed: {avg_speed:.2f} m/s | ADE: {ade:.3f}m | FDE: {fde:.3f}m',
+            f'{category}  |  {avg_speed:.2f} m/s\nADE: {ade:.3f}m  FDE: {fde:.3f}m',
             fontsize=12, fontweight='bold', color=color
         )
         ax.legend(fontsize=9, loc='best', framealpha=0.9)
         ax.grid(True, alpha=0.3, linestyle='--')
         ax.set_aspect('equal', adjustable='box')
-        
-        # Add background color based on category
         ax.set_facecolor('#f8f9fa')
 
-        # DEBUG INFO (fixed indexing)
-        print(f"\n🔍 DEBUG Sample {idx}:")  # ← Fixed: was 'i'
-        print(f"Input sequence velocities (last 3 frames):")
-        print(f"  {input_seq[-3:, 2:4]}")  # ← Fixed: removed [0]
-        
-        print(f"Predictions velocities (first 3 steps):")
-        print(f"  {predictions[:3, 2:4]}")
-        
-        print(f"Ground truth velocities (first 3 steps):")
-        print(f"  {ground_truth[:3, 2:4]}")
-        
-        # Check if direction flips
-        pred_direction = np.arctan2(predictions[0, 3], predictions[0, 2])
-        true_direction = np.arctan2(ground_truth[0, 3], ground_truth[0, 2])
-        print(f"Predicted direction: {np.degrees(pred_direction):.1f}°")
-        print(f"True direction: {np.degrees(true_direction):.1f}°")
-        print(f"Difference: {np.degrees(pred_direction - true_direction):.1f}°")
-    
-    # ← MOVED OUTSIDE LOOP! (was inside)
-    plt.tight_layout()
-    plt.savefig('predictive_module/plot/trajectory_predictions_improved.png', dpi=200, bbox_inches='tight')
-    print("\n✅ Improved visualization saved!")
+    cross_tag = '(cross-domain, normalized)' if cross_domain else '(domain-matched)'
+    fig.suptitle(f'{mode_label}  {cross_tag}  |  K-means boundary: {boundary:.2f} m/s',
+                 fontsize=13, fontweight='bold')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])   # leave 5% at top for suptitle
+    save_path = os.path.join(save_dir, 'trajectory_predictions_improved.png')
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    print(f"   ✅ Trajectory plot saved → {save_path}")
     plt.show()
 
 
 def visualize_error_over_time(
     model,
-    trajectories,
+    valid_trajs,
     n_trajectories=50,
     sequence_length=10,
-    prediction_horizon=5,
-    device='cuda'
+    prediction_horizon=10,
+    device='cuda',
+    save_dir='predictive_module/plot',
+    cross_domain=False,
+    mode_label='',
 ):
-    """
-    Show how prediction error grows over prediction horizon
-    """
-    
+    """Plot how position and velocity error grows step-by-step."""
     model.eval()
-    
+
     all_position_errors = []
     all_velocity_errors = []
-    
-    for traj_idx in range(min(n_trajectories, len(trajectories))):
-        trajectory = trajectories[traj_idx]
-        
-        if len(trajectory) < sequence_length + prediction_horizon:
-            continue
-        
-        # Random start
+
+    for trajectory in valid_trajs[:n_trajectories]:
         max_start = len(trajectory) - sequence_length - prediction_horizon
         if max_start <= 0:
-            continue  # Skip this trajectory (too short)
+            continue
         start_idx = np.random.randint(0, max_start)
-        input_seq = trajectory[start_idx:start_idx+sequence_length]
-        ground_truth = trajectory[start_idx+sequence_length:start_idx+sequence_length+prediction_horizon]
-        print(f"Trajectory length: {len(trajectory)}")
-        print(f"Start idx: {start_idx}")
-        print(f"Sequence: {start_idx} to {start_idx + sequence_length}")
-        print(f"Ground truth: {start_idx + sequence_length} to {start_idx + sequence_length + prediction_horizon}")
-        print(f"Ground truth shape: {ground_truth.shape}")
-        print(f"First position: {ground_truth[0, :2]}")
-        print(f"Last sequence position: {input_seq[-1, :2]}")
-        # Predict
+
+        input_seq    = trajectory[start_idx:start_idx+sequence_length].copy()
+        ground_truth = trajectory[start_idx+sequence_length:start_idx+sequence_length+prediction_horizon].copy()
+
+        if cross_domain:
+            input_seq, ground_truth = _apply_normalization(input_seq, ground_truth)
+
         with torch.no_grad():
             input_tensor = torch.FloatTensor(input_seq).unsqueeze(0).to(device)
             predictions = model.predict_sequence(input_tensor, prediction_horizon)
             predictions = predictions.cpu().numpy()[0]
-        
-        # Calculate errors at each timestep
-        position_errors = np.linalg.norm(predictions[:, :2] - ground_truth[:, :2], axis=1)
-        velocity_errors = np.linalg.norm(predictions[:, 2:4] - ground_truth[:, 2:4], axis=1)
-        
-        all_position_errors.append(position_errors)
-        all_velocity_errors.append(velocity_errors)
-    
-    # Convert to arrays
+
+        all_position_errors.append(np.linalg.norm(predictions[:, :2] - ground_truth[:, :2], axis=1))
+        all_velocity_errors.append(np.linalg.norm(predictions[:, 2:4] - ground_truth[:, 2:4], axis=1))
+
     all_position_errors = np.array(all_position_errors)
     all_velocity_errors = np.array(all_velocity_errors)
-    
-    # Calculate statistics
-    mean_pos_error = all_position_errors.mean(axis=0)
-    std_pos_error = all_position_errors.std(axis=0)
-    
-    mean_vel_error = all_velocity_errors.mean(axis=0)
-    std_vel_error = all_velocity_errors.std(axis=0)
-    
-    # Plot
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
+
+    mean_pos = all_position_errors.mean(axis=0)
+    std_pos  = all_position_errors.std(axis=0)
+    mean_vel = all_velocity_errors.mean(axis=0)
+    std_vel  = all_velocity_errors.std(axis=0)
+
     timesteps = np.arange(1, prediction_horizon+1)
-    
-    # Position error over time
-    axes[0].plot(timesteps, mean_pos_error, 'b-', linewidth=2, label='Mean Error')
-    axes[0].fill_between(timesteps, 
-                         mean_pos_error - std_pos_error,
-                         mean_pos_error + std_pos_error,
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].plot(timesteps, mean_pos, 'b-', linewidth=2, label='Mean Error')
+    axes[0].fill_between(timesteps, mean_pos - std_pos, mean_pos + std_pos,
                          alpha=0.3, label='±1 Std Dev')
     axes[0].set_xlabel('Prediction Step', fontsize=12)
     axes[0].set_ylabel('Position Error (m)', fontsize=12)
     axes[0].set_title('Position Error Growth Over Time', fontsize=13)
     axes[0].legend(fontsize=10)
     axes[0].grid(True, alpha=0.3)
-    
-    # Velocity error over time
-    axes[1].plot(timesteps, mean_vel_error, 'r-', linewidth=2, label='Mean Error')
-    axes[1].fill_between(timesteps,
-                         mean_vel_error - std_vel_error,
-                         mean_vel_error + std_vel_error,
+
+    axes[1].plot(timesteps, mean_vel, 'r-', linewidth=2, label='Mean Error')
+    axes[1].fill_between(timesteps, mean_vel - std_vel, mean_vel + std_vel,
                          alpha=0.3, label='±1 Std Dev')
     axes[1].set_xlabel('Prediction Step', fontsize=12)
     axes[1].set_ylabel('Velocity Error (m/s)', fontsize=12)
     axes[1].set_title('Velocity Error Growth Over Time', fontsize=13)
     axes[1].legend(fontsize=10)
     axes[1].grid(True, alpha=0.3)
-    
+
+    cross_tag = '(cross-domain)' if cross_domain else '(domain-matched)'
+    fig.suptitle(f'{mode_label}  {cross_tag}', fontsize=13, fontweight='bold')
+
     plt.tight_layout()
-    plt.savefig('predictive_module/plot/error_over_time.png', dpi=150)
-    print("Error growth visualization saved to predictive_module/plot/error_over_time.png")
+    save_path = os.path.join(save_dir, 'error_over_time.png')
+    plt.savefig(save_path, dpi=150)
+    print(f"   ✅ Error-over-time plot saved → {save_path}")
     plt.show()
 
 
 def visualize_speed_comparison(
     model,
-    trajectories,
+    valid_trajs,        # pre-filtered and aligned with labels
+    labels,             # K-means labels (0=low, 1=high)
+    boundary,           # K-means boundary (m/s)
+    low_center,
+    high_center,
     sequence_length=10,
-    prediction_horizon=5,
-    device='cuda'
+    prediction_horizon=10,
+    device='cuda',
+    save_dir='predictive_module/plot',
+    cross_domain=False,
+    mode_label='',
 ):
-    """
-    Compare prediction accuracy using K-means discovered speed groups
-    TRUE K-means clustering - discovers boundary from data!
-    """
-    
+    """Boxplot comparing prediction error between K-means speed clusters."""
     model.eval()
-    
-    # Step 1: Extract all speeds from trajectories
-    print("\n" + "="*60)
-    print("K-MEANS CLUSTERING ANALYSIS")
-    print("="*60)
-    
-    all_speeds = []
-    trajectory_speeds = []
-    
-    for trajectory in trajectories:
-        if len(trajectory) < sequence_length + prediction_horizon + 1:
-            continue
-        
-        speeds = np.linalg.norm(trajectory[:, 2:4], axis=1)
-        avg_speed = speeds.mean()
-        all_speeds.append(avg_speed)
-        trajectory_speeds.append((trajectory, avg_speed))
-    
-    all_speeds = np.array(all_speeds).reshape(-1, 1)
-    
-    # Step 2: K-means discovers natural grouping
-    from sklearn.cluster import KMeans
-    
-    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(all_speeds)
-    
-    # Get cluster centers
-    centers = kmeans.cluster_centers_.flatten()
-    low_center = centers.min()
-    high_center = centers.max()
-    discovered_boundary = (low_center + high_center) / 2
-    
-    # Determine which cluster is low vs high
-    low_cluster = 0 if centers[0] < centers[1] else 1
-    high_cluster = 1 - low_cluster
-    
-    print(f"\n✅ K-means Discovered Speed Groups:")
-    print(f"  Low-speed cluster center: {low_center:.2f} m/s (n={np.sum(labels==low_cluster)})")
-    print(f"  High-speed cluster center: {high_center:.2f} m/s (n={np.sum(labels==high_cluster)})")
-    print(f"  Discovered boundary: {discovered_boundary:.2f} m/s")
-    print(f"\n📊 Compare to manual threshold (2.0 m/s):")
-    print(f"  Difference: {abs(discovered_boundary - 2.0):.3f} m/s")
-    if abs(discovered_boundary - 2.0) < 0.3:
-        print(f"  ✅ K-means validates 2.0 m/s assumption!")
-    else:
-        print(f"  ⚠️ K-means suggests different boundary: {discovered_boundary:.2f} m/s")
-    print("="*60)
-    
-    # Step 3: Evaluate predictions for each K-means cluster
-    low_speed_errors = []
+
+    low_speed_errors  = []
     high_speed_errors = []
-    
-    for (trajectory, avg_speed), label in zip(trajectory_speeds, labels):
-        if len(trajectory) < sequence_length + prediction_horizon + 1:
-            continue
-        
-        # Random start
+
+    for trajectory, label in zip(valid_trajs, labels):
         max_start = len(trajectory) - sequence_length - prediction_horizon
         if max_start <= 0:
             continue
         start_idx = np.random.randint(0, max_start)
-        
-        input_seq = trajectory[start_idx:start_idx+sequence_length]
-        ground_truth = trajectory[start_idx+sequence_length:start_idx+sequence_length+prediction_horizon]
-        
-        # Predict
+
+        input_seq    = trajectory[start_idx:start_idx+sequence_length].copy()
+        ground_truth = trajectory[start_idx+sequence_length:start_idx+sequence_length+prediction_horizon].copy()
+
+        if cross_domain:
+            input_seq, ground_truth = _apply_normalization(input_seq, ground_truth)
+
         with torch.no_grad():
             input_tensor = torch.FloatTensor(input_seq).unsqueeze(0).to(device)
             predictions = model.predict_sequence(input_tensor, prediction_horizon)
             predictions = predictions.cpu().numpy()[0]
-        
-        # Error
-        position_error = np.linalg.norm(predictions[:, :2] - ground_truth[:, :2], axis=1).mean()
-        
-        # Classify by K-means label (NOT manual threshold!)
-        if label == low_cluster:
-            low_speed_errors.append(position_error)
+
+        error = np.linalg.norm(predictions[:, :2] - ground_truth[:, :2], axis=1).mean()
+        if label == 0:
+            low_speed_errors.append(error)
         else:
-            high_speed_errors.append(position_error)
-    
-    # Step 4: Plot comparison
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    positions = [1, 2]
-    data = [low_speed_errors, high_speed_errors]
-    labels_text = [
-        f'Low-Speed Cluster\n(μ={low_center:.2f} m/s)\nn={len(low_speed_errors)}',
-        f'High-Speed Cluster\n(μ={high_center:.2f} m/s)\nn={len(high_speed_errors)}'
-    ]
-    
-    bp = ax.boxplot(data, positions=positions, widths=0.6, patch_artist=True,
-                    labels=labels_text,
-                    boxprops=dict(facecolor='lightblue', alpha=0.7),
-                    medianprops=dict(color='red', linewidth=2),
-                    showfliers=True)
-    
-    ax.set_ylabel('Position Error (m)', fontsize=12, fontweight='bold')
-    ax.set_title(
-        f'Prediction Accuracy: K-means Discovered Clusters\n'
-        f'Boundary: {discovered_boundary:.2f} m/s (vs manual 2.0 m/s)',
-        fontsize=13, fontweight='bold'
-    )
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    # Add statistics
-    low_mean = np.mean(low_speed_errors)
+            high_speed_errors.append(error)
+
+    low_mean  = np.mean(low_speed_errors)
     high_mean = np.mean(high_speed_errors)
-    
-    ax.text(1, low_mean, f'Mean: {low_mean:.4f}m', 
-           ha='center', va='bottom', fontsize=10, fontweight='bold',
-           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    ax.text(2, high_mean, f'Mean: {high_mean:.4f}m',
-           ha='center', va='bottom', fontsize=10, fontweight='bold',
-           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    
-    # Add K-means benefit analysis
+
     if low_mean > high_mean:
-        benefit_pct = ((low_mean - high_mean) / low_mean) * 100
+        benefit_pct = (low_mean - high_mean) / low_mean * 100
         winner = "High-speed"
-        print(f"\n✅ K-means Benefit: High-speed predictions {benefit_pct:.1f}% better")
+        print(f"   ✅ High-speed predictions {benefit_pct:.1f}% better than low-speed")
     else:
-        benefit_pct = ((high_mean - low_mean) / high_mean) * 100
+        benefit_pct = (high_mean - low_mean) / high_mean * 100
         winner = "Low-speed"
-        print(f"\n⚠️ Inverted: Low-speed predictions {benefit_pct:.1f}% better")
-    
-    ax.text(0.5, 0.95, 
-           f'{winner} cluster has {benefit_pct:.1f}% lower error\n'
-           f'K-means boundary: {discovered_boundary:.2f} m/s',
-           transform=ax.transAxes, fontsize=11,
-           verticalalignment='top',
-           bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.3))
-    
+        print(f"   ⚠️  Low-speed predictions {benefit_pct:.1f}% better than high-speed")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    labels_text = [
+        f'Low-Speed\n(μ={low_center:.2f} m/s)\nn={len(low_speed_errors)}',
+        f'High-Speed\n(μ={high_center:.2f} m/s)\nn={len(high_speed_errors)}',
+    ]
+    ax.boxplot([low_speed_errors, high_speed_errors],
+               positions=[1, 2], widths=0.6, patch_artist=True,
+               labels=labels_text,
+               boxprops=dict(facecolor='lightblue', alpha=0.7),
+               medianprops=dict(color='red', linewidth=2),
+               showfliers=True)
+
+    ax.text(1, low_mean,  f'Mean: {low_mean:.4f}m',  ha='center', va='bottom',
+            fontsize=10, fontweight='bold',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    ax.text(2, high_mean, f'Mean: {high_mean:.4f}m', ha='center', va='bottom',
+            fontsize=10, fontweight='bold',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    ax.text(0.5, 0.95,
+            f'{winner} cluster: {benefit_pct:.1f}% lower error\nBoundary: {boundary:.2f} m/s',
+            transform=ax.transAxes, fontsize=11, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.3))
+
+    cross_tag = '(cross-domain)' if cross_domain else '(domain-matched)'
+    ax.set_ylabel('Position Error (m)', fontsize=12, fontweight='bold')
+    ax.set_title(f'K-means Speed Clusters — {mode_label}  {cross_tag}\n'
+                 f'Boundary: {boundary:.2f} m/s',
+                 fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+
     plt.tight_layout()
-    plt.savefig('predictive_module/plot/speed_comparison.png', dpi=150, bbox_inches='tight')
-    print(f"\n✅ Speed comparison saved to predictive_module/plot/speed_comparison.png")
-    print(f"   Low-speed cluster: {low_mean:.4f}m (n={len(low_speed_errors)})")
-    print(f"   High-speed cluster: {high_mean:.4f}m (n={len(high_speed_errors)})")
-    print(f"   K-means discovered boundary: {discovered_boundary:.2f} m/s")
-    print("="*60)
-    
+    save_path = os.path.join(save_dir, 'speed_comparison.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"   ✅ Speed comparison saved → {save_path}")
     plt.show()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Load test data
-    print("Loading test data...")
-    with open('predictive_module/data/eth_ucy_processed.pkl', 'rb') as f:
-        data = pickle.load(f)
-    
-    import random
-    trajectories = data['trajectories']
-    n_train = int(0.7 * len(trajectories))
-    n_val = int(0.15 * len(trajectories))
-    test_trajectories = trajectories[n_train+n_val:]
-    
-    print(f"Using {len(test_trajectories)} test trajectories")
-    
-    
-    # Load trained model
-    print("Loading trained model...")
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = TrajectoryGRU(
-        input_size=4,
-        hidden_size=128,
-        num_layers=3,
-        output_size=4,
-    ).to(device)
-    model.load_state_dict(torch.load('predictive_module/model/kgru_model_eth_ucy.pth'))
-    model.eval()
 
-    # Test: Does model predict consistent direction?
-    print("\n🔬 Testing directional consistency...")
+    # ── Select which modes to run (comment out any to skip) ──────────────────
+    EVAL_MODES = [
+        {
+            'key':         'eth_eth',
+            'label':       'ETH/UCY → ETH/UCY',
+            'model_path':  'predictive_module/model/kgru_eth_ucy.pth',
+            'data_path':   'predictive_module/data/eth_ucy_real_pedestrians.pkl',
+            'downsample':  False,
+            'cross_domain': False,
+            'plot_dir':    'predictive_module/plot/eth',
+        },
+        {
+            'key':         'syn_syn',
+            'label':       'Synthetic → Synthetic',
+            'model_path':  'predictive_module/model/kgru_synthetic.pth',
+            'data_path':   'predictive_module/data/synthetic_mixed_traffic.pkl',
+            'downsample':  True,
+            'cross_domain': False,
+            'plot_dir':    'predictive_module/plot/synthetic',
+        },
+        {
+            'key':         'syn_eth',
+            'label':       'Synthetic → ETH/UCY',
+            'model_path':  'predictive_module/model/kgru_synthetic.pth',
+            'data_path':   'predictive_module/data/eth_ucy_real_pedestrians.pkl',
+            'downsample':  False,
+            'cross_domain': True,
+            'plot_dir':    'predictive_module/plot/syn_to_eth',
+        },
+        {
+            'key':         'eth_syn',
+            'label':       'ETH/UCY → Synthetic',
+            'model_path':  'predictive_module/model/kgru_eth_ucy.pth',
+            'data_path':   'predictive_module/data/synthetic_mixed_traffic.pkl',
+            'downsample':  True,
+            'cross_domain': True,
+            'plot_dir':    'predictive_module/plot/eth_to_syn',
+        },
+    ]
+    # ─────────────────────────────────────────────────────────────────────────
 
-    test_sequence = torch.randn(1, 10, 4).to(device)  # Random trajectory
-    test_sequence[:, :, 2:] = 1.0  # Moving right at 1 m/s
+    SEQ_LEN  = 10
+    HORIZON  = 10
+    device   = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Predict 5 times (should be same result)
-    predictions = []
-    for i in range(5):
-        pred, _ = model(test_sequence)
-        predictions.append(pred[0, 2].item())  # x-velocity
+    # Cache loaded datasets so we don't reload the same file twice
+    _data_cache  = {}
+    _model_cache = {}
 
-    print(f"Predicted x-velocities: {predictions}")
-    print(f"Std deviation: {np.std(predictions):.4f}")
+    for mode in EVAL_MODES:
+        print("\n" + "="*65)
+        print(f"  {mode['label']}  {'[cross-domain]' if mode['cross_domain'] else '[domain-matched]'}")
+        print("="*65)
 
-    if np.std(predictions) > 0.01:
-        print("⚠️ Model is NOT consistent! (Augmentation problem)")
-    else:
-        print("✅ Model is consistent")
-    
-    print("\n" + "="*60)
-    print("GENERATING VISUALIZATIONS")
-    print("="*60)
-    
-    # 1. Trajectory predictions
-    print("\n1. Visualizing trajectory predictions...")
-    visualize_trajectory_predictions(
-        model, 
-        test_trajectories,
-        n_samples=6,
-        sequence_length=10,
-        prediction_horizon=10,  # Reduced from 20 to 10
-        device=device
-    )
-    
-    # 2. Error growth over time
-    print("\n2. Analyzing error growth over prediction horizon...")
-    visualize_error_over_time(
-        model,
-        test_trajectories,
-        n_trajectories=50,
-        sequence_length=10,
-        prediction_horizon=10,  # Reduced from 20 to 10
-        device=device
-    )
-    
-    # 3. Speed comparison
-    print("\n3. Comparing low-speed vs high-speed predictions...")
-    visualize_speed_comparison(
-        model,
-        test_trajectories,
-        sequence_length=10,
-        prediction_horizon=10,  # Reduced from 15 to 10
-        device=device
-    )
-    
-    print("\n" + "="*60)
-    print("VISUALIZATION COMPLETE!")
-    print("="*60)
-    print("\nGenerated files:")
-    print("  - predictive_module/plot/trajectory_predictions.png (6 example trajectories)")
-    print("  - predictive_module/plot/error_over_time.png (error growth analysis)")
-    print("  - predictive_module/plot/speed_comparison.png (low vs high speed accuracy)")
+        os.makedirs(mode['plot_dir'], exist_ok=True)
+
+        # ── Load data ────────────────────────────────────────────────────────
+        if mode['data_path'] not in _data_cache:
+            with open(mode['data_path'], 'rb') as f:
+                raw = pickle.load(f)
+            trajs = raw['trajectories']
+            if mode['downsample']:
+                trajs = downsample_trajectories(trajs, source_dt=0.1, target_dt=0.4)
+            _data_cache[mode['data_path']] = trajs
+        trajectories = _data_cache[mode['data_path']]
+
+        n_train = int(0.7 * len(trajectories))
+        n_val   = int(0.15 * len(trajectories))
+        test_trajectories = trajectories[n_train + n_val:]
+
+        # ── Load model ───────────────────────────────────────────────────────
+        if mode['model_path'] not in _model_cache:
+            m = TrajectoryGRU(input_size=4, hidden_size=128,
+                              num_layers=3, output_size=4).to(device)
+            m.load_state_dict(torch.load(mode['model_path'], map_location=device))
+            m.eval()
+            _model_cache[mode['model_path']] = m
+        model = _model_cache[mode['model_path']]
+
+        # ── K-means on ALL trajectories → boundary matches global analysis ──────
+        # (same distribution as analyze_kmeans_clustering in train_kgru.py)
+        boundary, low_center, high_center, all_labels = kmeans_speed_clusters(trajectories)
+
+        # Slice to test split, then filter by minimum length
+        test_labels = all_labels[n_train + n_val:]
+        valid_mask  = np.array([len(t) >= SEQ_LEN + HORIZON + 1 for t in test_trajectories])
+        valid_trajs = [t for t, m in zip(test_trajectories, valid_mask) if m]
+        labels      = test_labels[valid_mask]
+
+        if len(valid_trajs) < 6:
+            print(f"   ⚠️  Only {len(valid_trajs)} valid trajectories — skipping mode.")
+            continue
+
+        print(f"   K-means: {low_center:.2f} m/s (low) | {boundary:.2f} m/s (boundary)"
+              f" | {high_center:.2f} m/s (high)")
+        print(f"   Samples: {len(valid_trajs)} valid  "
+              f"(low={int(np.sum(labels==0))}, high={int(np.sum(labels==1))})")
+
+        # ── 1. Trajectory predictions ─────────────────────────────────────────
+        print("\n   1. Trajectory predictions...")
+        visualize_trajectory_predictions(
+            model, valid_trajs, labels, boundary,
+            n_samples=6, sequence_length=SEQ_LEN, prediction_horizon=HORIZON,
+            device=device, save_dir=mode['plot_dir'],
+            cross_domain=mode['cross_domain'], mode_label=mode['label'],
+        )
+
+        # ── 2. Error over time ────────────────────────────────────────────────
+        print("   2. Error over time...")
+        visualize_error_over_time(
+            model, valid_trajs,
+            n_trajectories=50, sequence_length=SEQ_LEN, prediction_horizon=HORIZON,
+            device=device, save_dir=mode['plot_dir'],
+            cross_domain=mode['cross_domain'], mode_label=mode['label'],
+        )
+
+        # ── 3. Speed comparison ───────────────────────────────────────────────
+        print("   3. Speed comparison (K-means clusters)...")
+        visualize_speed_comparison(
+            model, valid_trajs, labels, boundary, low_center, high_center,
+            sequence_length=SEQ_LEN, prediction_horizon=HORIZON,
+            device=device, save_dir=mode['plot_dir'],
+            cross_domain=mode['cross_domain'], mode_label=mode['label'],
+        )
+
+    print("\n" + "="*65)
+    print("VISUALIZATION COMPLETE")
+    print("="*65)
+    print("Output directories:")
+    for mode in EVAL_MODES:
+        print(f"  {mode['plot_dir']}/  ({mode['label']})")

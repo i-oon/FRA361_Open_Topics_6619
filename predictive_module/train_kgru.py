@@ -15,6 +15,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from predictive_module.k_gru_predictor import TrajectoryGRU
+from predictive_module.utils import kmeans_speed_clusters, downsample_trajectories
 import matplotlib.pyplot as plt
 import pickle
 from tqdm import tqdm
@@ -290,93 +291,54 @@ def evaluate_predictions(model, test_loader, device='cuda', save_plots=True):
 
 
 def analyze_kmeans_clustering(train_trajectories):
-    """
-    Analyze K-means clustering on training data
-    Validates that K-means discovers natural speed boundaries
-    """
+    """Validate that K-means discovers natural speed boundaries in training data."""
     print("\n" + "="*60)
     print("K-MEANS CLUSTERING VALIDATION")
     print("="*60)
-    
-    # Extract speeds from training trajectories
-    all_speeds = []
-    for traj in train_trajectories:
-        speeds = np.linalg.norm(traj[:, 2:4], axis=1)
-        all_speeds.append(speeds.mean())
-    
-    all_speeds = np.array(all_speeds).reshape(-1, 1)
-    
-    # K-means clustering (discovers natural grouping)
-    from sklearn.cluster import KMeans
-    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(all_speeds)
-    
-    # Analyze discovered clusters
-    centers = kmeans.cluster_centers_.flatten()
-    low_center = centers.min()
-    high_center = centers.max()
-    discovered_boundary = (low_center + high_center) / 2
-    
-    # Determine which cluster is low vs high
-    low_cluster = 0 if centers[0] < centers[1] else 1
-    high_cluster = 1 - low_cluster
-    
-    n_low = np.sum(labels == low_cluster)
-    n_high = np.sum(labels == high_cluster)
-    
+
+    boundary, low_center, high_center, labels = kmeans_speed_clusters(train_trajectories)
+    n_low  = int(np.sum(labels == 0))
+    n_high = int(np.sum(labels == 1))
+
     print(f"\n✅ K-means Discovered Speed Groups:")
-    print(f"  Low-speed cluster:")
-    print(f"    Center: {low_center:.2f} m/s")
-    print(f"    Count: {n_low} ({n_low/len(labels)*100:.1f}%)")
-    print(f"  High-speed cluster:")
-    print(f"    Center: {high_center:.2f} m/s")
-    print(f"    Count: {n_high} ({n_high/len(labels)*100:.1f}%)")
-    print(f"  Discovered boundary: {discovered_boundary:.2f} m/s")
-    
-    # Compare to manual threshold
-    manual_threshold = 2.0
-    print(f"\n📊 Validation Against Manual Threshold:")
-    print(f"  K-means discovered: {discovered_boundary:.2f} m/s")
-    print(f"  Manual threshold: {manual_threshold:.2f} m/s")
-    print(f"  Difference: {abs(discovered_boundary - manual_threshold):.3f} m/s")
-    
-    if abs(discovered_boundary - manual_threshold) < 0.3:
+    print(f"  Low-speed cluster:  {low_center:.2f} m/s  (n={n_low}, {n_low/len(labels)*100:.1f}%)")
+    print(f"  High-speed cluster: {high_center:.2f} m/s  (n={n_high}, {n_high/len(labels)*100:.1f}%)")
+    print(f"  Discovered boundary: {boundary:.2f} m/s")
+
+    diff = abs(boundary - 2.0)
+    print(f"\n📊 Validation Against Manual Threshold (2.0 m/s):")
+    print(f"  Difference: {diff:.3f} m/s")
+    if diff < 0.3:
         print(f"  ✅ K-means validates bimodal assumption!")
-        print(f"     Natural boundary closely matches 2.0 m/s threshold")
     else:
-        print(f"  ⚠️ K-means suggests different boundary: {discovered_boundary:.2f} m/s")
-        print(f"     Consider using discovered boundary for evaluation")
-    
-    # Check for severe imbalance
+        print(f"  ⚠️ K-means suggests different boundary: {boundary:.2f} m/s")
+
     balance_ratio = min(n_low, n_high) / max(n_low, n_high)
-    print(f"\n📊 Cluster Balance:")
-    print(f"  Ratio: {balance_ratio:.2%} (minority/majority)")
-    
+    print(f"\n📊 Cluster Balance: {balance_ratio:.2%} (minority/majority)")
     if balance_ratio < 0.1:
-        print(f"  ⚠️ SEVERE IMBALANCE! ({n_low} vs {n_high})")
-        print(f"     K-means clustering may not be beneficial")
-        print(f"     Consider regenerating data with balanced speeds")
+        print(f"  ⚠️ SEVERE IMBALANCE ({n_low} vs {n_high})")
     elif balance_ratio < 0.3:
         print(f"  ⚠️ Imbalanced clusters")
-        print(f"     K-means benefit may be limited")
     else:
         print(f"  ✅ Reasonably balanced clusters")
-        print(f"     K-means clustering is meaningful")
-    
+
     print("="*60)
-    
-    return discovered_boundary, low_center, high_center
+    return boundary, low_center, high_center
 
 
 if __name__ == "__main__":
     # Load collected data
     print("Loading training data...")
-    with open('predictive_module/data/eth_ucy_processed.pkl', 'rb') as f:
+    with open('predictive_module/data/synthetic_mixed_traffic.pkl', 'rb') as f:
         data = pickle.load(f)
     
     trajectories = data['trajectories']
     print(f"Loaded {len(trajectories)} trajectories")
-    
+
+    # Downsample 10Hz (dt=0.1s) → 2.5Hz (dt=0.4s) to match ETH/UCY temporal resolution
+    trajectories = downsample_trajectories(trajectories, source_dt=0.1, target_dt=0.4)
+    print(f"After downsampling to 2.5Hz: {len(trajectories)} trajectories")
+
     # Split data: 70% train, 15% val, 15% test
     n_train = int(0.7 * len(trajectories))
     n_val = int(0.15 * len(trajectories))
@@ -424,11 +386,11 @@ if __name__ == "__main__":
         lr=0.001,
         device=device,
         patience=15,
-        save_path='predictive_module/model/kgru_model_eth_ucy.pth'
+        save_path='predictive_module/model/kgru_synthetic.pth'
     )
     
     # Load best model for evaluation
-    model.load_state_dict(torch.load('predictive_module/model/kgru_model_eth_ucy.pth'))
+    model.load_state_dict(torch.load('predictive_module/model/kgru_synthetic.pth'))
     
     # Evaluate on test set
     ade, fde, vel_error = evaluate_predictions(model, test_loader, device=device)
