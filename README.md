@@ -220,6 +220,13 @@ ETH/UCY   → Synthetic          3.5620 ± 2.4023        24
 
 ### Transfer Gap Analysis
 
+<p align="center">
+    <img width="49%" src="predictive_module/plot/eth_to_syn/trajectory_predictions_improved.png">
+    <img width="49%" src="predictive_module/plot/syn_to_eth/trajectory_predictions_improved.png">
+    </br>
+  
+</p>
+
 | Direction | Baseline | Cross-Domain | Transfer Gap | Significance |
 |---|---|---|---|---|
 | Synthetic → Real | 0.4335m | 0.5286m | **+22%** | Small — model generalises well |
