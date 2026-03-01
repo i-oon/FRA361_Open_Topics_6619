@@ -1,330 +1,136 @@
 """
-K-GRU Kalman Prediction Module
-Based on: Liu et al. (2025) - Adaptive Motion Planning Leveraging 
-Speed-Differentiated Prediction for Mobile Robots in Dynamic Environments
+K-GRU v2: Enhanced with class labels
+Input: [x, y, vx, vy, is_car, is_ped, is_truck, is_bicycle] = 8D
+Output: [x, y, vx, vy] = 4D (class is constant)
+
+CRITICAL FIX: Hidden state reset to avoid temporal inversion
 """
 
-import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.cluster import KMeans
-from filterpy.kalman import KalmanFilter
-from collections import deque
-
-class KGRUPredictor:
-    """
-    K-GRU Kalman predictor for dynamic obstacle trajectories
-    
-    Combines:
-    1. K-means clustering (speed-based grouping)
-    2. Kalman filtering (state estimation)
-    3. GRU network (trajectory prediction)
-    """
-    
-    def __init__(
-        self,
-        history_length=10,
-        dt=0.1,  # Timestep (from MuJoCo)
-        low_speed_threshold=0.2,
-        high_speed_threshold=1.1,
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    ):
-        self.history_length = history_length
-        self.dt = dt
-        self.low_speed_threshold = low_speed_threshold
-        self.high_speed_threshold = high_speed_threshold
-        self.device = device
-        
-        # GRU network
-        self.gru_model = TrajectoryGRU(
-            input_size=4,
-            hidden_size=128,
-            num_layers=3,
-            output_size=4,
-            dropout=0.2
-        ).to(device)
-        
-        # K-means clusterer
-        self.kmeans = KMeans(n_clusters=2, random_state=42)
-        
-        # History buffers for each obstacle
-        self.obstacle_histories = {}
-        
-        # Kalman filters for each obstacle
-        self.kalman_filters = {}
-        
-    def _init_kalman_filter(self):
-        """Initialize Kalman filter with Brownian motion model"""
-        kf = KalmanFilter(dim_x=4, dim_z=4)
-        
-        # State transition matrix (Brownian motion)
-        kf.F = np.array([
-            [1, 0, self.dt, 0],
-            [0, 1, 0, self.dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ])
-        
-        # Observation matrix (observe all states)
-        kf.H = np.eye(4)
-        
-        # Process noise covariance
-        kf.Q = np.eye(4) * 0.01
-        
-        # Measurement noise covariance
-        kf.R = np.eye(4) * 0.1
-        
-        # Initial state covariance
-        kf.P *= 1.0
-        
-        return kf
-    
-    def update(self, obstacle_states):
-        """
-        Update predictor with new obstacle observations
-        
-        Args:
-            obstacle_states: List of dicts with keys ['id', 'pos', 'vel', 'speed_group']
-                            pos: (x, y), vel: (vx, vy)
-        """
-        for obs in obstacle_states:
-            obs_id = obs['id']
-            state = np.array([
-                obs['pos'][0],
-                obs['pos'][1],
-                obs['vel'][0],
-                obs['vel'][1]
-            ])
-            
-            # Initialize history buffer if new obstacle
-            if obs_id not in self.obstacle_histories:
-                self.obstacle_histories[obs_id] = deque(maxlen=self.history_length)
-                self.kalman_filters[obs_id] = self._init_kalman_filter()
-                self.kalman_filters[obs_id].x = state
-            
-            # Kalman filter update
-            kf = self.kalman_filters[obs_id]
-            kf.predict()
-            kf.update(state)
-            
-            # Store filtered state in history
-            self.obstacle_histories[obs_id].append(kf.x.copy())
-    
-    def classify_speeds(self, obstacle_states):
-        """
-        K-means clustering to discover natural speed groups
-        
-        TRUE K-means: Discovers boundary from data, not manual threshold!
-        
-        Returns:
-            low_speed_ids: List of obstacle IDs in discovered low-speed group
-            high_speed_ids: List of obstacle IDs in discovered high-speed group
-            boundary: Discovered speed boundary
-        """
-        if len(obstacle_states) < 2:
-            # Not enough obstacles for clustering
-            # Use single obstacle's speed vs median of history
-            speeds = [np.linalg.norm(obs['vel']) for obs in obstacle_states]
-            ids = [obs['id'] for obs in obstacle_states]
-            
-            # Default boundary if we have history
-            if hasattr(self, 'discovered_boundary'):
-                boundary = self.discovered_boundary
-            else:
-                boundary = 2.0  # Fallback only
-            
-            low_speed_ids = [id for id, s in zip(ids, speeds) if s < boundary]
-            high_speed_ids = [id for id, s in zip(ids, speeds) if s >= boundary]
-            return low_speed_ids, high_speed_ids, boundary
-        
-        # Extract velocities for clustering
-        velocities = np.array([obs['vel'] for obs in obstacle_states])
-        speeds = np.linalg.norm(velocities, axis=1).reshape(-1, 1)
-        
-        # K-means clustering - DISCOVERS the grouping!
-        labels = self.kmeans.fit_predict(speeds)
-        
-        # Determine which cluster is low-speed vs high-speed
-        cluster_means = [speeds[labels == i].mean() for i in range(2)]
-        low_cluster = 0 if cluster_means[0] < cluster_means[1] else 1
-        high_cluster = 1 - low_cluster
-        
-        # Calculate discovered boundary
-        centers = self.kmeans.cluster_centers_.flatten()
-        self.discovered_boundary = (centers[0] + centers[1]) / 2
-        
-        # Separate obstacle IDs based on K-means labels
-        low_speed_ids = [obs['id'] for obs, label in zip(obstacle_states, labels) 
-                        if label == low_cluster]
-        high_speed_ids = [obs['id'] for obs, label in zip(obstacle_states, labels) 
-                        if label == high_cluster]
-        
-        return low_speed_ids, high_speed_ids, self.discovered_boundary
-    
-    def predict(self, obstacle_states, prediction_horizon=5):
-        """
-        Predict future trajectories for all obstacles using K-means clustering
-        
-        Args:
-            obstacle_states: Current obstacle observations
-            prediction_horizon: Number of timesteps to predict ahead
-            
-        Returns:
-            predictions: Dict mapping obstacle_id -> predicted trajectory
-            boundary: K-means discovered speed boundary (for analysis)
-        """
-        # Update with current observations
-        self.update(obstacle_states)
-        
-        # Classify into speed groups using K-means
-        low_speed_ids, high_speed_ids, boundary = self.classify_speeds(obstacle_states)
-        
-        predictions = {}
-        
-        # Process low-speed obstacles first (priority)
-        for obs_id in low_speed_ids:
-            if obs_id in self.obstacle_histories and len(self.obstacle_histories[obs_id]) >= 3:
-                trajectory = self._predict_gru(obs_id, prediction_horizon)
-                predictions[obs_id] = trajectory
-        
-        # Process high-speed obstacles (delayed)
-        for obs_id in high_speed_ids:
-            if obs_id in self.obstacle_histories and len(self.obstacle_histories[obs_id]) >= 3:
-                trajectory = self._predict_gru(obs_id, prediction_horizon)
-                predictions[obs_id] = trajectory
-        
-        return predictions, boundary
-    
-    def _predict_gru(self, obs_id, horizon):
-        """
-        Use GRU to predict trajectory for single obstacle
-        
-        Args:
-            obs_id: Obstacle ID
-            horizon: Prediction horizon
-            
-        Returns:
-            trajectory: Array of shape (horizon, 4)
-        """
-        history = np.array(list(self.obstacle_histories[obs_id]))
-        
-        # Convert to tensor
-        history_tensor = torch.FloatTensor(history).unsqueeze(0).to(self.device)
-        
-        # Predict using GRU
-        with torch.no_grad():
-            trajectory = self.gru_model.predict_sequence(history_tensor, horizon)
-        
-        return trajectory.cpu().numpy()[0]  # Shape: (horizon, 4)
-    
-    def save_model(self, path):
-        """Save trained GRU model"""
-        torch.save(self.gru_model.state_dict(), path)
-    
-    def load_model(self, path):
-        """Load trained GRU model"""
-        self.gru_model.load_state_dict(torch.load(path, map_location=self.device))
-        self.gru_model.eval()
 
 
 class TrajectoryGRU(nn.Module):
     """
-    GRU network for trajectory prediction
+    Enhanced GRU with class label inputs
     
-    Architecture from Liu et al. (2025):
-    - Input: (batch, seq_len, 4) where 4 = [x, y, vx, vy]
-    - GRU: 2 layers, 50 hidden units
-    - Output: (batch, 4) predicted next state
+    Architecture:
+    - Input: (batch, seq_len, 8) - motion + class
+    - GRU: 3 layers, 128 hidden units
+    - Output: (batch, seq_len, 4) - motion only
     """
     
-    def __init__(self, input_size=4, hidden_size=50, num_layers=2, output_size=4):
-        super(TrajectoryGRU, self).__init__()
+    def __init__(self, input_size=8, hidden_size=128, num_layers=3, output_size=4, dropout=0.2):
+        super().__init__()
         
+        self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.output_size = output_size
         
-        # GRU layer
+        # GRU layers
         self.gru = nn.GRU(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            batch_first=True
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
         )
         
-        # Dense output layer
+        # Output projection (predict motion only, not class)
         self.fc = nn.Linear(hidden_size, output_size)
-        
+    
     def forward(self, x, hidden=None):
         """
         Forward pass
         
         Args:
-            x: Input sequence (batch, seq_len, 4)
-            hidden: Initial hidden state (optional)
-            
+            x: (batch, seq_len, 8) - input sequence with class
+            hidden: Optional GRU hidden state
+        
         Returns:
-            output: Predicted next state (batch, 4)
-            hidden: Final hidden state
+            output: (batch, seq_len, 4) - predicted motion
+            hidden: Updated hidden state
         """
         # GRU forward
         gru_out, hidden = self.gru(x, hidden)
         
-        # Take last timestep output
-        last_output = gru_out[:, -1, :]
-        
-        # Dense layer
-        output = self.fc(last_output)
+        # Project to motion
+        output = self.fc(gru_out)
         
         return output, hidden
     
-    def predict_sequence(self, x, horizon):
+    def predict_sequence(self, input_seq, horizon=100):
         """
-        Predict trajectory for multiple timesteps
+        Autoregressive multi-step prediction
+        
+        CRITICAL FIX: Reset hidden=None each step to avoid temporal inversion
         
         Args:
-            x: Initial sequence (batch, seq_len, 4)
-            horizon: Number of steps to predict
-            
+            input_seq: (batch, obs_len, 8) - observed sequence with class
+            horizon: Number of future steps to predict
+        
         Returns:
-            predictions: Predicted trajectory (batch, horizon, 4)
+            predictions: (batch, horizon, 4) - predicted motion only
         """
         self.eval()
+        device = input_seq.device
+        batch_size = input_seq.shape[0]
+        
         predictions = []
         
-        current_input = x
-
-        for step in range(horizon):  # ← Changed from _ to step
-            # Predict next step
-            # Reset hidden each step: the sliding window already contains full context,
-            # so carrying hidden state from the previous window causes temporal confusion
-            # (hidden encodes up to t_9 but next window starts at t_1, going backwards).
-            pred, _ = self.forward(current_input, None)
-            
-            # ========== ADD DEBUG CODE HERE ==========
-            if step == 0:  # Only debug first prediction
-                print(f"\n🔍 Prediction Debug (Step {step}):")
-                print(f"Input last velocity: {current_input[0, -1, 2:4].cpu().numpy()}")
-                print(f"First prediction velocity: {pred[0, 2:4].cpu().numpy()}")
-                
-                # Check if velocity direction flips
-                input_vel = current_input[0, -1, 2:4].cpu().numpy()
-                pred_vel = pred[0, 2:4].cpu().numpy()
-                
-                dot_product = np.dot(input_vel, pred_vel)
-                print(f"Velocity dot product: {dot_product:.4f}")
-                
-                if dot_product < 0:
-                    print("⚠️ VELOCITY DIRECTION FLIPPED!")
-                else:
-                    print("✅ Velocity direction maintained")
-            # ==========================================
-            
-            predictions.append(pred)
-            
-            # Update input: append prediction, remove oldest
-            current_input = torch.cat([
-                current_input[:, 1:, :],
-                pred.unsqueeze(1)
-            ], dim=1)
+        # Extract class (constant throughout prediction)
+        # Shape: (batch, 4)
+        agent_class = input_seq[:, -1, 4:8]
         
-        return torch.stack(predictions, dim=1)
+        # Start with observed sequence
+        current_seq = input_seq.clone()
+        
+        with torch.no_grad():
+            for step in range(horizon):
+                # ✅ CRITICAL FIX: Reset hidden state each step!
+                # This prevents temporal inversion bug
+                pred_motion, _ = self.forward(current_seq, hidden=None)
+                
+                # Take last prediction
+                next_motion = pred_motion[:, -1:, :]  # (batch, 1, 4)
+                
+                # Append class to create full 8D input
+                next_full = torch.cat([
+                    next_motion,
+                    agent_class.unsqueeze(1)  # (batch, 1, 4)
+                ], dim=2)  # (batch, 1, 8)
+                
+                # Store motion prediction
+                predictions.append(next_motion)
+                
+                # Update sequence (sliding window)
+                current_seq = torch.cat([
+                    current_seq[:, 1:, :],  # Remove oldest
+                    next_full                # Add newest
+                ], dim=1)
+        
+        # Stack predictions
+        predictions = torch.cat(predictions, dim=1)  # (batch, horizon, 4)
+        
+        return predictions
+
+
+if __name__ == "__main__":
+    # Test model
+    print("Testing TrajectoryGRU...")
+    
+    model = TrajectoryGRU(input_size=8, hidden_size=128, num_layers=3, output_size=4)
+    
+    # Test input: batch=2, seq_len=25 (1s @ 25Hz), features=8
+    test_input = torch.randn(2, 25, 8)
+    
+    # Forward pass
+    output, hidden = model(test_input)
+    print(f"Forward pass: {test_input.shape} -> {output.shape}")
+    
+    # Autoregressive prediction
+    predictions = model.predict_sequence(test_input, horizon=100)
+    print(f"Prediction: {test_input.shape} -> {predictions.shape}")
+    
+    print("✅ Model test passed!")
