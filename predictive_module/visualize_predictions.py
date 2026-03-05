@@ -18,6 +18,7 @@ from predictive_module.k_gru_predictor import TrajectoryGRU
 from predictive_module.utils import (
     kmeans_speed_clusters,
     downsample_trajectories,
+    upsample_trajectories,
     normalize_sequence,
 )
 
@@ -41,7 +42,8 @@ def visualize_trajectory_predictions(
     prediction_horizon=10,
     device='cuda',
     save_dir='predictive_module/plot',
-    cross_domain=False,
+    cross_domain=False,      # controls plot label only
+    normalize_input=False,   # controls position normalization at inference
     mode_label='',
 ):
     """Plot 3 low-speed + 3 high-speed examples with ground truth vs predicted."""
@@ -76,7 +78,7 @@ def visualize_trajectory_predictions(
 
         avg_speed = np.mean(np.linalg.norm(input_seq[:, 2:4], axis=1))
 
-        if cross_domain:
+        if normalize_input:
             input_seq, ground_truth = _apply_normalization(input_seq, ground_truth)
 
         with torch.no_grad():
@@ -155,6 +157,7 @@ def visualize_error_over_time(
     device='cuda',
     save_dir='predictive_module/plot',
     cross_domain=False,
+    normalize_input=False,
     mode_label='',
 ):
     """Plot how position and velocity error grows step-by-step."""
@@ -172,7 +175,7 @@ def visualize_error_over_time(
         input_seq    = trajectory[start_idx:start_idx+sequence_length].copy()
         ground_truth = trajectory[start_idx+sequence_length:start_idx+sequence_length+prediction_horizon].copy()
 
-        if cross_domain:
+        if normalize_input:
             input_seq, ground_truth = _apply_normalization(input_seq, ground_truth)
 
         with torch.no_grad():
@@ -234,6 +237,7 @@ def visualize_speed_comparison(
     device='cuda',
     save_dir='predictive_module/plot',
     cross_domain=False,
+    normalize_input=False,
     mode_label='',
 ):
     """Boxplot comparing prediction error between K-means speed clusters."""
@@ -251,7 +255,7 @@ def visualize_speed_comparison(
         input_seq    = trajectory[start_idx:start_idx+sequence_length].copy()
         ground_truth = trajectory[start_idx+sequence_length:start_idx+sequence_length+prediction_horizon].copy()
 
-        if cross_domain:
+        if normalize_input:
             input_seq, ground_truth = _apply_normalization(input_seq, ground_truth)
 
         with torch.no_grad():
@@ -327,6 +331,10 @@ if __name__ == "__main__":
             'downsample':  False,
             'cross_domain': False,
             'plot_dir':    'predictive_module/plot/eth',
+            'input_size':  4,
+            'seq_len':     10,   # 10 × 0.4s = 4s observation
+            'horizon':     10,   # 10 × 0.4s = 4s prediction
+            'dropout':     0.2,
         },
         {
             'key':         'syn_syn',
@@ -336,6 +344,10 @@ if __name__ == "__main__":
             'downsample':  True,
             'cross_domain': False,
             'plot_dir':    'predictive_module/plot/synthetic',
+            'input_size':  4,
+            'seq_len':     10,
+            'horizon':     10,
+            'dropout':     0.2,
         },
         {
             'key':         'syn_eth',
@@ -345,6 +357,10 @@ if __name__ == "__main__":
             'downsample':  False,
             'cross_domain': True,
             'plot_dir':    'predictive_module/plot/syn_to_eth',
+            'input_size':  4,
+            'seq_len':     10,
+            'horizon':     10,
+            'dropout':     0.2,
         },
         {
             'key':         'eth_syn',
@@ -354,13 +370,102 @@ if __name__ == "__main__":
             'downsample':  True,
             'cross_domain': True,
             'plot_dir':    'predictive_module/plot/eth_to_syn',
+            'input_size':  4,
+            'seq_len':     10,
+            'horizon':     10,
+            'dropout':     0.2,
+        },
+        {
+            'key':           'ind',
+            'label':         'inD → inD',
+            'model_path':    'predictive_module/model/kgru_ind.pth',
+            'data_path':     'predictive_module/data/ind_with_class.pkl',
+            'downsample':    False,   # already at 25 Hz
+            'cross_domain':  False,
+            'normalize_input': True,  # model trained with position normalization
+            'plot_dir':      'predictive_module/plot/ind',
+            'input_size':    8,       # [x, y, vx, vy, is_car, is_ped, is_truck, is_bicycle]
+            'seq_len':       25,      # 25 × 0.04s = 1s observation
+            'horizon':       25,      # 25 × 0.04s = 1s prediction
+            'dropout':       0.5,
+            'pad_class':     None,
+            'max_speed':     20.0,    # filter tracking-error outliers (99th%=15.88 m/s)
+        },
+        # ── Cross-domain: ETH/Syn model → inD data (truncate 8D→4D) ─────────
+        {
+            'key':                  'eth_ind',
+            'label':                'ETH/UCY → inD',
+            'model_path':           'predictive_module/model/kgru_eth_ucy.pth',
+            'data_path':            'predictive_module/data/ind_with_class.pkl',
+            'downsample':           True,
+            'downsample_source_dt': 0.04,   # inD 25Hz (dt=0.04s) → 2.5Hz (dt=0.4s)
+            'downsample_target_dt': 0.4,
+            'cross_domain':         True,
+            'plot_dir':             'predictive_module/plot/eth_to_ind',
+            'input_size':           4,       # ETH model: 4D; class cols truncated at runtime
+            'seq_len':              10,
+            'horizon':              10,
+            'dropout':              0.2,
+            'pad_class':            None,
+            'max_speed':            20.0,
+        },
+        {
+            'key':                  'syn_ind',
+            'label':                'Synthetic → inD',
+            'model_path':           'predictive_module/model/kgru_synthetic.pth',
+            'data_path':            'predictive_module/data/ind_with_class.pkl',
+            'downsample':           True,
+            'downsample_source_dt': 0.04,   # inD 25Hz (dt=0.04s) → 2.5Hz (dt=0.4s)
+            'downsample_target_dt': 0.4,
+            'cross_domain':         True,
+            'plot_dir':             'predictive_module/plot/syn_to_ind',
+            'input_size':           4,
+            'seq_len':              10,
+            'horizon':              10,
+            'dropout':              0.2,
+            'pad_class':            None,
+            'max_speed':            20.0,
+        },
+        # ── Cross-domain: inD model → ETH/Syn data (upsample + pad class) ──────
+        # ETH/UCY is all pedestrians → pad [is_car=0, is_ped=1, is_truck=0, is_bicycle=0]
+        # Upsample ETH 2.5Hz → 25Hz so temporal scale matches inD training
+        {
+            'key':               'ind_eth',
+            'label':             'inD → ETH/UCY',
+            'model_path':        'predictive_module/model/kgru_ind.pth',
+            'data_path':         'predictive_module/data/eth_ucy_real_pedestrians.pkl',
+            'downsample':        False,
+            'upsample_source_dt': 0.4,   # ETH 2.5Hz → 25Hz (×10)
+            'cross_domain':      True,
+            'normalize_input':   True,
+            'plot_dir':          'predictive_module/plot/ind_to_eth',
+            'input_size':        8,
+            'seq_len':           25,      # 25 × 0.04s = 1s (matches inD training)
+            'horizon':           25,
+            'dropout':           0.5,
+            'pad_class':         [0, 1, 0, 0],   # all ETH agents are pedestrians
+        },
+        # Synthetic 10Hz → 25Hz (×2.5); class unknown → pad zeros
+        {
+            'key':               'ind_syn',
+            'label':             'inD → Synthetic',
+            'model_path':        'predictive_module/model/kgru_ind.pth',
+            'data_path':         'predictive_module/data/synthetic_mixed_traffic.pkl',
+            'downsample':        False,
+            'upsample_source_dt': 0.1,   # Syn 10Hz → 25Hz (×2.5)
+            'cross_domain':      True,
+            'normalize_input':   True,
+            'plot_dir':          'predictive_module/plot/ind_to_syn',
+            'input_size':        8,
+            'seq_len':           25,
+            'horizon':           25,
+            'dropout':           0.5,
+            'pad_class':         [0, 0, 0, 0],   # class unknown for synthetic agents
         },
     ]
     # ─────────────────────────────────────────────────────────────────────────
 
-    SEQ_LEN  = 10
-    HORIZON  = 10
-    device   = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # Cache loaded datasets so we don't reload the same file twice
     _data_cache  = {}
@@ -374,14 +479,44 @@ if __name__ == "__main__":
         os.makedirs(mode['plot_dir'], exist_ok=True)
 
         # ── Load data ────────────────────────────────────────────────────────
-        if mode['data_path'] not in _data_cache:
+        pad_class        = mode.get('pad_class')
+        max_speed        = mode.get('max_speed')
+        upsample_src_dt  = mode.get('upsample_source_dt')
+        ds_src_key       = mode.get('downsample_source_dt', 0.1)
+        ds_tgt_key       = mode.get('downsample_target_dt', 0.4)
+        cache_key = (mode['data_path'], mode['downsample'], ds_src_key, ds_tgt_key,
+                     upsample_src_dt,
+                     tuple(pad_class) if pad_class is not None else None,
+                     max_speed)
+        if cache_key not in _data_cache:
             with open(mode['data_path'], 'rb') as f:
                 raw = pickle.load(f)
             trajs = raw['trajectories']
             if mode['downsample']:
-                trajs = downsample_trajectories(trajs, source_dt=0.1, target_dt=0.4)
-            _data_cache[mode['data_path']] = trajs
-        trajectories = _data_cache[mode['data_path']]
+                ds_src = mode.get('downsample_source_dt', 0.1)
+                ds_tgt = mode.get('downsample_target_dt', 0.4)
+                before = len(trajs)
+                trajs = downsample_trajectories(trajs, source_dt=ds_src, target_dt=ds_tgt)
+                factor = int(round(ds_tgt / ds_src))
+                print(f"   Downsample: {ds_src}s → {ds_tgt}s  (stride={factor}x, "
+                      f"{before} → {len(trajs)} trajectories)")
+            if upsample_src_dt is not None:
+                before = len(trajs)
+                trajs = upsample_trajectories(trajs, source_dt=upsample_src_dt,
+                                              target_dt=0.04)
+                print(f"   Upsample: {upsample_src_dt}s → 0.04s  "
+                      f"({before} → {len(trajs)} trajectories)")
+            if max_speed is not None:
+                before = len(trajs)
+                trajs = [t for t in trajs
+                         if np.mean(np.linalg.norm(t[:, 2:4], axis=1)) <= max_speed]
+                print(f"   Speed filter: {before} → {len(trajs)} trajectories "
+                      f"(removed {before - len(trajs)} outliers > {max_speed} m/s)")
+            if pad_class is not None:
+                pad = np.array(pad_class, dtype=np.float32)
+                trajs = [np.hstack([t, np.tile(pad, (len(t), 1))]) for t in trajs]
+            _data_cache[cache_key] = trajs
+        trajectories = _data_cache[cache_key]
 
         n_train = int(0.7 * len(trajectories))
         n_val   = int(0.15 * len(trajectories))
@@ -389,9 +524,14 @@ if __name__ == "__main__":
 
         # ── Load model ───────────────────────────────────────────────────────
         if mode['model_path'] not in _model_cache:
-            m = TrajectoryGRU(input_size=4, hidden_size=128,
-                              num_layers=3, output_size=4).to(device)
-            m.load_state_dict(torch.load(mode['model_path'], map_location=device))
+            m = TrajectoryGRU(input_size=mode['input_size'], hidden_size=128,
+                              num_layers=3, output_size=4,
+                              dropout=mode['dropout']).to(device)
+            checkpoint = torch.load(mode['model_path'], map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                m.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                m.load_state_dict(checkpoint)
             m.eval()
             _model_cache[mode['model_path']] = m
         model = _model_cache[mode['model_path']]
@@ -402,9 +542,15 @@ if __name__ == "__main__":
 
         # Slice to test split, then filter by minimum length
         test_labels = all_labels[n_train + n_val:]
-        valid_mask  = np.array([len(t) >= SEQ_LEN + HORIZON + 1 for t in test_trajectories])
+        valid_mask  = np.array([len(t) >= mode['seq_len'] + mode['horizon'] + 1 for t in test_trajectories])
         valid_trajs = [t for t, m in zip(test_trajectories, valid_mask) if m]
         labels      = test_labels[valid_mask]
+
+        # Truncate feature dim if model expects fewer cols than data provides
+        # (e.g. ETH/Syn model on inD 8D data → keep only [x,y,vx,vy])
+        feat_dim = mode['input_size']
+        if valid_trajs and valid_trajs[0].shape[1] > feat_dim:
+            valid_trajs = [t[:, :feat_dim] for t in valid_trajs]
 
         if len(valid_trajs) < 6:
             print(f"   ⚠️  Only {len(valid_trajs)} valid trajectories — skipping mode.")
@@ -415,31 +561,38 @@ if __name__ == "__main__":
         print(f"   Samples: {len(valid_trajs)} valid  "
               f"(low={int(np.sum(labels==0))}, high={int(np.sum(labels==1))})")
 
+        # normalize_input: True for inD model (trained w/ normalization) and
+        # all cross-domain modes; falls back to cross_domain for ETH/Syn modes
+        normalize_input = mode.get('normalize_input', mode['cross_domain'])
+
         # ── 1. Trajectory predictions ─────────────────────────────────────────
         print("\n   1. Trajectory predictions...")
         visualize_trajectory_predictions(
             model, valid_trajs, labels, boundary,
-            n_samples=6, sequence_length=SEQ_LEN, prediction_horizon=HORIZON,
+            n_samples=6, sequence_length=mode['seq_len'], prediction_horizon=mode['horizon'],
             device=device, save_dir=mode['plot_dir'],
-            cross_domain=mode['cross_domain'], mode_label=mode['label'],
+            cross_domain=mode['cross_domain'], normalize_input=normalize_input,
+            mode_label=mode['label'],
         )
 
         # ── 2. Error over time ────────────────────────────────────────────────
         print("   2. Error over time...")
         visualize_error_over_time(
             model, valid_trajs,
-            n_trajectories=50, sequence_length=SEQ_LEN, prediction_horizon=HORIZON,
+            n_trajectories=50, sequence_length=mode['seq_len'], prediction_horizon=mode['horizon'],
             device=device, save_dir=mode['plot_dir'],
-            cross_domain=mode['cross_domain'], mode_label=mode['label'],
+            cross_domain=mode['cross_domain'], normalize_input=normalize_input,
+            mode_label=mode['label'],
         )
 
         # ── 3. Speed comparison ───────────────────────────────────────────────
         print("   3. Speed comparison (K-means clusters)...")
         visualize_speed_comparison(
             model, valid_trajs, labels, boundary, low_center, high_center,
-            sequence_length=SEQ_LEN, prediction_horizon=HORIZON,
+            sequence_length=mode['seq_len'], prediction_horizon=mode['horizon'],
             device=device, save_dir=mode['plot_dir'],
-            cross_domain=mode['cross_domain'], mode_label=mode['label'],
+            cross_domain=mode['cross_domain'], normalize_input=normalize_input,
+            mode_label=mode['label'],
         )
 
     print("\n" + "="*65)

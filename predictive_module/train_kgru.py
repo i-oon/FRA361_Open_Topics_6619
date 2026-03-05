@@ -54,14 +54,63 @@ class TrajectoryDataset(Dataset):
     
     def __getitem__(self, idx):
         input_seq, target = self.samples[idx]
-        
-        # Optional augmentation (only for training)
+        input_seq = input_seq.copy()   # always copy — we will mutate below
+        target    = target.copy()
+
         if self.augment:
-            # Add small Gaussian noise to positions and velocities
-            noise = np.random.normal(0, 0.01, input_seq[:, :4].shape)
-            input_seq = input_seq.copy()
-            input_seq[:, :4] += noise
-        
+            # 1. Position noise (realistic GPS/tracking error)
+            pos_noise = np.random.normal(0, 0.05, input_seq[:, :2].shape)  # ± 5cm
+            input_seq[:, :2] += pos_noise
+
+            # 2. Velocity noise (acceleration/measurement error)
+            vel_noise = np.random.normal(0, 0.1, input_seq[:, 2:4].shape)   # ± 0.1 m/s
+            input_seq[:, 2:4] += vel_noise
+
+            # 3. Random small rotation (heading error)
+            if np.random.rand() < 0.3:  # 30% chance
+                angle = np.random.uniform(-3, 3) * np.pi / 180  # ± 3 degrees
+                cos_a, sin_a = np.cos(angle), np.sin(angle)
+
+                # Rotate positions relative to first frame
+                origin = input_seq[0, :2]
+                rel_pos = input_seq[:, :2] - origin
+
+                rotated = np.zeros_like(rel_pos)
+                rotated[:, 0] = rel_pos[:, 0] * cos_a - rel_pos[:, 1] * sin_a
+                rotated[:, 1] = rel_pos[:, 0] * sin_a + rel_pos[:, 1] * cos_a
+
+                input_seq[:, :2] = rotated + origin
+
+                # Rotate velocities
+                vel = input_seq[:, 2:4]
+                rotated_vel = np.zeros_like(vel)
+                rotated_vel[:, 0] = vel[:, 0] * cos_a - vel[:, 1] * sin_a
+                rotated_vel[:, 1] = vel[:, 0] * sin_a + vel[:, 1] * cos_a
+                input_seq[:, 2:4] = rotated_vel
+
+            # 4. Random scaling (speed variation)
+            if np.random.rand() < 0.2:  # 20% chance
+                scale = np.random.uniform(0.95, 1.05)  # ± 5% speed
+                input_seq[:, 2:4] *= scale
+
+            # 5. Random dropout frames (occlusion simulation)
+            if np.random.rand() < 0.1:  # 10% chance
+                n_dropout = np.random.randint(1, 4)  # Drop 1-3 frames
+                dropout_idx = np.random.choice(len(input_seq), n_dropout, replace=False)
+                # Interpolate dropped frames
+                for drop_i in dropout_idx:
+                    if drop_i > 0 and drop_i < len(input_seq) - 1:
+                        input_seq[drop_i, :4] = (input_seq[drop_i-1, :4] + input_seq[drop_i+1, :4]) / 2
+
+        # Position normalization: shift so the last observed frame is at origin.
+        # Makes the model position-invariant → predictions generalize across
+        # different coordinate systems (crucial for cross-domain evaluation).
+        origin_xy = input_seq[-1, :2].copy()
+        input_seq[:, 0] -= origin_xy[0]
+        input_seq[:, 1] -= origin_xy[1]
+        target[0] -= origin_xy[0]
+        target[1] -= origin_xy[1]
+
         return (
             torch.FloatTensor(input_seq),
             torch.FloatTensor(target)
@@ -73,7 +122,7 @@ def train_kgru(
     save_path='predictive_module/model/kgru_ind.pth',
     sequence_length=25,      # 1 second @ 25 Hz
     batch_size=128,          # Smaller batch (8D input = more memory)
-    epochs=150,
+    epochs=100,
     learning_rate=0.001,
     patience=15,             # Early stopping patience
     device=None
@@ -148,15 +197,15 @@ def train_kgru(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True,
-        num_workers=4,
-        pin_memory=True if device == 'cuda' else False
+        num_workers=2,
+        pin_memory=False
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False,
-        num_workers=4,
-        pin_memory=True if device == 'cuda' else False
+        num_workers=2,
+        pin_memory=False
     )
     
     # Model
@@ -166,14 +215,14 @@ def train_kgru(
         hidden_size=128,
         num_layers=3,
         output_size=4,
-        dropout=0.2
+        dropout=0.5
     ).to(device)
     
     print(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Loss and optimizer
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     
     # Training loop
     print(f"\n🚀 Training...")
@@ -295,7 +344,7 @@ if __name__ == "__main__":
         save_path='predictive_module/model/kgru_ind.pth',
         sequence_length=25,   # 1 second @ 25 Hz
         batch_size=128,       # Adjust based on GPU memory
-        epochs=150,
+        epochs=100,
         learning_rate=0.001,
         patience=15
     )

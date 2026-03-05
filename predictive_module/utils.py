@@ -49,6 +49,45 @@ def normalize_sequence(seq):
     return normalized, origin
 
 
+def upsample_trajectories(trajectories, source_dt=0.4, target_dt=0.04, min_length=51):
+    """
+    Upsample trajectories from source_dt to target_dt using linear interpolation,
+    then recompute velocities at the new temporal resolution.
+
+    Handles non-integer scale factors (e.g. 0.1s → 0.04s = ×2.5).
+
+    Args:
+        trajectories : list of (N, D) arrays where cols 0-3 are [x, y, vx, vy]
+        source_dt    : time step of the input data (seconds)
+        target_dt    : desired time step (seconds)
+        min_length   : minimum number of frames to keep a trajectory
+
+    Returns:
+        List of upsampled trajectories that meet the length requirement.
+    """
+    result = []
+    for traj in trajectories:
+        n_orig = len(traj)
+        n_new  = int(round((n_orig - 1) * source_dt / target_dt)) + 1
+
+        orig_times = np.linspace(0, (n_orig - 1) * source_dt, n_orig)
+        new_times  = np.linspace(0, (n_orig - 1) * source_dt, n_new)
+
+        new_traj = np.zeros((n_new, traj.shape[1]), dtype=np.float32)
+        for col in range(traj.shape[1]):
+            new_traj[:, col] = np.interp(new_times, orig_times, traj[:, col])
+
+        # Recompute velocities from interpolated positions
+        for i in range(len(new_traj) - 1):
+            new_traj[i, 2] = (new_traj[i+1, 0] - new_traj[i, 0]) / target_dt
+            new_traj[i, 3] = (new_traj[i+1, 1] - new_traj[i, 1]) / target_dt
+        new_traj[-1, 2:4] = new_traj[-2, 2:4]
+
+        if len(new_traj) >= min_length:
+            result.append(new_traj)
+    return result
+
+
 def downsample_trajectories(trajectories, source_dt=0.1, target_dt=0.4, min_length=11):
     """
     Downsample trajectories from source_dt to target_dt by striding, then
