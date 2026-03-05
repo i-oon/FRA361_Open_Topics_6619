@@ -323,58 +323,58 @@ if __name__ == "__main__":
 
     # ── Select which modes to run (comment out any to skip) ──────────────────
     EVAL_MODES = [
-        {
-            'key':         'eth_eth',
-            'label':       'ETH/UCY → ETH/UCY',
-            'model_path':  'predictive_module/model/kgru_eth_ucy.pth',
-            'data_path':   'predictive_module/data/eth_ucy_real_pedestrians.pkl',
-            'downsample':  False,
-            'cross_domain': False,
-            'plot_dir':    'predictive_module/plot/eth',
-            'input_size':  4,
-            'seq_len':     10,   # 10 × 0.4s = 4s observation
-            'horizon':     10,   # 10 × 0.4s = 4s prediction
-            'dropout':     0.2,
-        },
-        {
-            'key':         'syn_syn',
-            'label':       'Synthetic → Synthetic',
-            'model_path':  'predictive_module/model/kgru_synthetic.pth',
-            'data_path':   'predictive_module/data/synthetic_mixed_traffic.pkl',
-            'downsample':  True,
-            'cross_domain': False,
-            'plot_dir':    'predictive_module/plot/synthetic',
-            'input_size':  4,
-            'seq_len':     10,
-            'horizon':     10,
-            'dropout':     0.2,
-        },
-        {
-            'key':         'syn_eth',
-            'label':       'Synthetic → ETH/UCY',
-            'model_path':  'predictive_module/model/kgru_synthetic.pth',
-            'data_path':   'predictive_module/data/eth_ucy_real_pedestrians.pkl',
-            'downsample':  False,
-            'cross_domain': True,
-            'plot_dir':    'predictive_module/plot/syn_to_eth',
-            'input_size':  4,
-            'seq_len':     10,
-            'horizon':     10,
-            'dropout':     0.2,
-        },
-        {
-            'key':         'eth_syn',
-            'label':       'ETH/UCY → Synthetic',
-            'model_path':  'predictive_module/model/kgru_eth_ucy.pth',
-            'data_path':   'predictive_module/data/synthetic_mixed_traffic.pkl',
-            'downsample':  True,
-            'cross_domain': True,
-            'plot_dir':    'predictive_module/plot/eth_to_syn',
-            'input_size':  4,
-            'seq_len':     10,
-            'horizon':     10,
-            'dropout':     0.2,
-        },
+        # {
+        #     'key':         'eth_eth',
+        #     'label':       'ETH/UCY → ETH/UCY',
+        #     'model_path':  'predictive_module/model/kgru_eth_ucy.pth',
+        #     'data_path':   'predictive_module/data/eth_ucy_real_pedestrians.pkl',
+        #     'downsample':  False,
+        #     'cross_domain': False,
+        #     'plot_dir':    'predictive_module/plot/eth',
+        #     'input_size':  4,
+        #     'seq_len':     10,   # 10 × 0.4s = 4s observation
+        #     'horizon':     10,   # 10 × 0.4s = 4s prediction
+        #     'dropout':     0.2,
+        # },
+        # {
+        #     'key':         'syn_syn',
+        #     'label':       'Synthetic → Synthetic',
+        #     'model_path':  'predictive_module/model/kgru_synthetic.pth',
+        #     'data_path':   'predictive_module/data/synthetic_mixed_traffic.pkl',
+        #     'downsample':  True,
+        #     'cross_domain': False,
+        #     'plot_dir':    'predictive_module/plot/synthetic',
+        #     'input_size':  4,
+        #     'seq_len':     10,
+        #     'horizon':     10,
+        #     'dropout':     0.2,
+        # },
+        # {
+        #     'key':         'syn_eth',
+        #     'label':       'Synthetic → ETH/UCY',
+        #     'model_path':  'predictive_module/model/kgru_synthetic.pth',
+        #     'data_path':   'predictive_module/data/eth_ucy_real_pedestrians.pkl',
+        #     'downsample':  False,
+        #     'cross_domain': True,
+        #     'plot_dir':    'predictive_module/plot/syn_to_eth',
+        #     'input_size':  4,
+        #     'seq_len':     10,
+        #     'horizon':     10,
+        #     'dropout':     0.2,
+        # },
+        # {
+        #     'key':         'eth_syn',
+        #     'label':       'ETH/UCY → Synthetic',
+        #     'model_path':  'predictive_module/model/kgru_eth_ucy.pth',
+        #     'data_path':   'predictive_module/data/synthetic_mixed_traffic.pkl',
+        #     'downsample':  True,
+        #     'cross_domain': True,
+        #     'plot_dir':    'predictive_module/plot/eth_to_syn',
+        #     'input_size':  4,
+        #     'seq_len':     10,
+        #     'horizon':     10,
+        #     'dropout':     0.2,
+        # },
         {
             'key':           'ind',
             'label':         'inD → inD',
@@ -524,14 +524,20 @@ if __name__ == "__main__":
 
         # ── Load model ───────────────────────────────────────────────────────
         if mode['model_path'] not in _model_cache:
-            m = TrajectoryGRU(input_size=mode['input_size'], hidden_size=128,
-                              num_layers=3, output_size=4,
-                              dropout=mode['dropout']).to(device)
             checkpoint = torch.load(mode['model_path'], map_location=device)
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                m.load_state_dict(checkpoint['model_state_dict'])
+                cfg = checkpoint.get('config', {})
+                hidden_size = cfg.get('hidden_size', 128)
+                num_layers  = cfg.get('num_layers',  3)
+                state_dict  = checkpoint['model_state_dict']
             else:
-                m.load_state_dict(checkpoint)
+                hidden_size = 128
+                num_layers  = 3
+                state_dict  = checkpoint
+            m = TrajectoryGRU(input_size=mode['input_size'], hidden_size=hidden_size,
+                              num_layers=num_layers, output_size=4,
+                              dropout=mode['dropout']).to(device)
+            m.load_state_dict(state_dict)
             m.eval()
             _model_cache[mode['model_path']] = m
         model = _model_cache[mode['model_path']]
