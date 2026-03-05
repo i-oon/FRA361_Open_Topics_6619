@@ -121,7 +121,7 @@ def train_kgru(
     data_path='predictive_module/data/ind_class.pkl',
     save_path='predictive_module/model/kgru_ind.pth',
     sequence_length=25,      # 1 second @ 25 Hz
-    batch_size=128,          # Smaller batch (8D input = more memory)
+    batch_size=256,          # Smaller batch (8D input = more memory)
     epochs=100,
     learning_rate=0.001,
     patience=15,             # Early stopping patience
@@ -197,25 +197,25 @@ def train_kgru(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True,
-        num_workers=2,
-        pin_memory=False
+        num_workers=8,
+        pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False,
-        num_workers=2,
-        pin_memory=False
+        num_workers=8,
+        pin_memory=True
     )
     
     # Model
     print(f"\n🤖 Creating model...")
     model = TrajectoryGRU(
         input_size=8,
-        hidden_size=128,
-        num_layers=3,
+        hidden_size=256,
+        num_layers=4,
         output_size=4,
-        dropout=0.5
+        dropout=0.3
     ).to(device)
     
     print(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -296,8 +296,8 @@ def train_kgru(
                 'val_loss': val_loss,
                 'config': {
                     'input_size': 8,
-                    'hidden_size': 128,
-                    'num_layers': 3,
+                    'hidden_size': 256,
+                    'num_layers': 4,
                     'output_size': 4,
                     'sequence_length': sequence_length,
                     'frequency': frequency,
@@ -343,7 +343,7 @@ if __name__ == "__main__":
         data_path='predictive_module/data/ind_with_class.pkl',
         save_path='predictive_module/model/kgru_ind.pth',
         sequence_length=25,   # 1 second @ 25 Hz
-        batch_size=128,       # Adjust based on GPU memory
+        batch_size=256,       # Adjust based on GPU memory
         epochs=100,
         learning_rate=0.001,
         patience=15
